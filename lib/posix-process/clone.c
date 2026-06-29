@@ -362,10 +362,21 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 	}
 	UK_ASSERT(pprocess);
 #if CONFIG_PLAT_HYPERLIGHT
-	if (pprocess->children.next != &pprocess->children ||
-	    pprocess->children.prev != &pprocess->children) {
-		pprocess = hyperlight_init_pprocess;
-		if (!pprocess ||
+	/* After snapshot-restore the posix_thread and pprocess of the
+	 * calling thread were freed during the pre-snapshot exit_group.
+	 * The allocator's free-list still contains their addresses, so
+	 * pthread_self / hyperlight_init_pthread point at freed memory.
+	 * Detect this via the stale EXITED state and rebuild both the
+	 * pprocess and the parent posix_thread before proceeding.
+	 */
+	{
+		struct posix_thread *_pt = pthread_self;
+		if (!_pt)
+			_pt = hyperlight_init_pthread;
+
+		if (!_pt || _pt->state == POSIX_THREAD_EXITED ||
+		    _pt->state == POSIX_THREAD_KILLED ||
+		    !pprocess || pprocess->state != POSIX_PROCESS_RUNNING ||
 		    pprocess->children.next != &pprocess->children ||
 		    pprocess->children.prev != &pprocess->children) {
 			pprocess = uk_zalloc(uk_alloc_get_default(),
@@ -385,14 +396,13 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 #endif
 			pid_process[1] = pprocess;
 			hyperlight_init_pprocess = pprocess;
-			if (hyperlight_init_pthread)
-				hyperlight_init_pthread->process = pprocess;
-			{
-				struct posix_thread *_cur_pt;
-				_cur_pt = uk_thread_uktls_var(t, pthread_self);
-				if (_cur_pt && _cur_pt != hyperlight_init_pthread)
-					_cur_pt->process = pprocess;
-			}
+
+			_pt = pprocess_create_pthread(pprocess, t);
+			UK_ASSERT(!PTRISERR(_pt));
+			_pt->parent = NULL;
+			_pt->state = POSIX_THREAD_RUNNING;
+			hyperlight_init_pthread = _pt;
+			pthread_self = _pt;
 		}
 	}
 #endif
@@ -478,6 +488,7 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 	if (flags & CLONE_VFORK) {
 		struct posix_thread *parent_pt = pthread_self;
 		__u64 parent_rsp;
+		__u64 vfork_save_sz;
 		void *stack_save;
 		/* fork is promoted to vfork (CLONE_VM): the child shares
 		 * the parent's userspace stack.  Between _Fork()'s return
@@ -496,9 +507,28 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		UK_ASSERT(parent_pt);
 
 		parent_rsp = uk_lcpu_regs_get(execenv->regs, SP);
-		stack_save = uk_malloc(s->a, VFORK_STACK_SAVE_SZ);
+		vfork_save_sz = VFORK_STACK_SAVE_SZ;
+#if CONFIG_PLAT_HYPERLIGHT
+		/* Hyperlight places the user stack near the top of the GVA
+		 * space (inside the scratch region).  Cap the save so the
+		 * memcpy never reads past the last data page.
+		 */
+		{
+			__u64 ceil = 0xFFFFFFFFFFFFE000ULL;
+			if (parent_rsp < ceil) {
+				__u64 avail = ceil - parent_rsp;
+				if (vfork_save_sz > avail)
+					vfork_save_sz = avail;
+			} else {
+				vfork_save_sz = 0;
+			}
+		}
+#endif
+		stack_save = uk_malloc(s->a,
+				       vfork_save_sz ? vfork_save_sz : 1);
 		UK_ASSERT(stack_save);
-		memcpy(stack_save, (void *)parent_rsp, VFORK_STACK_SAVE_SZ);
+		if (vfork_save_sz)
+			memcpy(stack_save, (void *)parent_rsp, vfork_save_sz);
 
 #if CONFIG_PLAT_HYPERLIGHT
 		hyperlight_vfork_parent_thread = t;
@@ -512,7 +542,8 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 			uk_sched_yield();
 #endif
 
-		memcpy((void *)parent_rsp, stack_save, VFORK_STACK_SAVE_SZ);
+		if (vfork_save_sz)
+			memcpy((void *)parent_rsp, stack_save, vfork_save_sz);
 		uk_free(s->a, stack_save);
 
 		goto out;
