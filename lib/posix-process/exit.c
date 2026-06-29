@@ -75,6 +75,10 @@ static inline int signal_exit(struct posix_process *pprocess)
 	__u64 exit_signal;
 
 	UK_ASSERT(pprocess);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!pprocess->signal || !pprocess->signal->sigaction)
+		return 1;
+#endif
 	UK_ASSERT(pprocess->signal);
 
 	if (pprocess->exit_signal)
@@ -106,11 +110,20 @@ void pprocess_exit_pthread(struct posix_thread *pthread,
 		  state == POSIX_THREAD_KILLED);
 
 	UK_ASSERT(pthread);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (pthread->state == POSIX_THREAD_EXITED ||
+	    pthread->state == POSIX_THREAD_KILLED)
+		return;
+#endif
 	UK_ASSERT(pthread->state != POSIX_THREAD_EXITED &&
 		  pthread->state != POSIX_THREAD_KILLED);
 
 	pprocess = pthread->process;
 	UK_ASSERT(pprocess);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (pprocess->state != POSIX_PROCESS_RUNNING)
+		return;
+#endif
 	UK_ASSERT(pprocess->state == POSIX_PROCESS_RUNNING);
 
 	uk_pr_debug("pid %d: exit tid %d\n", pprocess->pid, pthread->tid);
@@ -131,6 +144,9 @@ void pprocess_exit_pthread(struct posix_thread *pthread,
 	    parent_pthread->state == POSIX_THREAD_BLOCKED_VFORK) {
 		uk_thread_wake(parent_pthread->thread);
 		parent_pthread->state = POSIX_THREAD_RUNNING;
+#if CONFIG_PLAT_HYPERLIGHT
+		hyperlight_vfork_parent_thread = NULL;
+#endif
 	}
 
 	/* Release pthread and terminate the underlying uk_thread
@@ -160,6 +176,10 @@ void pprocess_exit(struct posix_process *pprocess,
 		  state == POSIX_PROCESS_KILLED);
 
 	UK_ASSERT(pprocess);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (pprocess->state != POSIX_PROCESS_RUNNING)
+		return;
+#endif
 	UK_ASSERT(pprocess->state == POSIX_PROCESS_RUNNING);
 
 	uk_pr_debug("pid %d: exit process\n", pprocess->pid);
@@ -249,21 +269,13 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 	this_thread = uk_thread_current();
 	this_pthread = uk_thread_uktls_var(this_thread, pthread_self);
 
-	if (!this_pthread) {
 #if CONFIG_PLAT_HYPERLIGHT
+	if (!this_pthread || this_pthread->process->pid == 1)
 		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-#else
-		uk_sched_thread_exit();
 #endif
-	}
 
+	UK_ASSERT(this_pthread);
 	UK_ASSERT(this_pthread->process);
-
-#if CONFIG_PLAT_HYPERLIGHT
-	if (this_pthread->process->pid == 1
-	    && uk_list_is_singular(&this_pthread->process->threads))
-		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-#endif
 
 	/* Last thread, exit the process */
 	if (uk_list_is_singular(&this_pthread->process->threads)) {
@@ -279,28 +291,17 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 UK_LLSYSCALL_R_DEFINE(int, exit_group, int, status)
 {
 	struct posix_thread *this_pthread;
-	struct posix_process *pprocess;
 
 	this_pthread = uk_pthread_current();
 
-	if (!this_pthread) {
 #if CONFIG_PLAT_HYPERLIGHT
-		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-#else
-		uk_sched_thread_exit();
-#endif
-	}
-
-	pprocess = this_pthread->process;
-	UK_ASSERT(pprocess);
-
-#if CONFIG_PLAT_HYPERLIGHT
-	if (pprocess->pid == 1
-	    && uk_list_is_singular(&pprocess->threads))
+	if (!this_pthread || this_pthread->process->pid == 1)
 		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
 #endif
 
-	pprocess_exit(pprocess, POSIX_PROCESS_EXITED, status);
+	UK_ASSERT(this_pthread);
+
+	pprocess_exit(this_pthread->process, POSIX_PROCESS_EXITED, status);
 	uk_sched_thread_exit();
 }
 #else /* !CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */

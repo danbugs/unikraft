@@ -53,6 +53,17 @@ struct posix_process *pid_process[TIDMAP_SIZE];
  */
 __uk_tls struct posix_thread *pthread_self = NULL;
 
+#if CONFIG_PLAT_HYPERLIGHT
+struct posix_thread *hyperlight_init_pthread;
+struct posix_process *hyperlight_init_pprocess;
+struct uk_thread *hyperlight_vfork_parent_thread;
+volatile unsigned long *hyperlight_parent_pthread_self_addr;
+/* Address of pthread_self in the INIT thread's TLS — written at boot,
+ * used by dispatch_prepare to restore the value after snapshot restore.
+ */
+__uptr hyperlight_init_pthread_self_addr;
+#endif
+
 /**
  * Helpers to find and reserve a `pid_t`
  */
@@ -127,6 +138,10 @@ struct posix_thread *pprocess_create_pthread(struct posix_process *pprocess,
 	pthread->_a = a;
 	pthread->process = pprocess;
 	pthread->parent = uk_pthread_current();
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!pthread->parent)
+		pthread->parent = hyperlight_init_pthread;
+#endif
 	pthread->tid = tid;
 	pthread->thread = th;
 
@@ -233,8 +248,13 @@ struct posix_process *pprocess_create(struct uk_alloc *a,
 	 */
 	pthread = &uk_thread_uktls_var(thread, pthread_self);
 
-	if (parent)
+	if (parent) {
 		parent_pthread = uk_thread_uktls_var(parent, pthread_self);
+#if CONFIG_PLAT_HYPERLIGHT
+		if (!parent_pthread)
+			parent_pthread = hyperlight_init_pthread;
+#endif
+	}
 	if (parent_pthread) {
 		 /* if we have a parent pthread,
 		  *  it must have a surrounding pprocess
@@ -260,9 +280,6 @@ struct posix_process *pprocess_create(struct uk_alloc *a,
 	ret = pprocess_signal_pdesc_alloc(pprocess);
 	if (unlikely(ret)) {
 		uk_pr_err("Could not allocate signal descriptor\n");
-		/* Free manually as we can jump to err_free_pprocess
-		 * after this allocation is successful.
-		 */
 		uk_free(a, pprocess);
 		goto err_out;
 	}
@@ -285,9 +302,17 @@ struct posix_process *pprocess_create(struct uk_alloc *a,
 			ret = PTR2ERR(_pthread);
 			goto err_free_pprocess;
 		}
+		if (parent_pthread)
+			_pthread->parent = parent_pthread;
 		/* take thread id for process id */
 		pprocess->pid = _pthread->tid;
 		*pthread = _pthread;
+#if CONFIG_PLAT_HYPERLIGHT
+		if (!parent) {
+			hyperlight_init_pthread = _pthread;
+			hyperlight_init_pprocess = pprocess;
+		}
+#endif
 	} else {
 		/* Re-use existing pthread, re-link it and re-use its TID */
 		UK_ASSERT((*pthread)->thread == thread);
@@ -332,9 +357,6 @@ struct posix_process *pprocess_create(struct uk_alloc *a,
 	}
 	pid_process[pprocess->pid] = pprocess;
 
-	uk_pr_debug("Process PID %d created (parent PID: %d)\n",
-		    (int) pprocess->pid,
-		    (int) ((pprocess->parent) ? pprocess->parent->pid : 0));
 	return pprocess;
 
 err_free_pprocess:
@@ -529,6 +551,28 @@ static int posix_process_init(struct uk_init_ctx *ictx)
 		return PTR2ERR(p);
 	}
 
+#if CONFIG_PLAT_HYPERLIGHT
+	/* Init table runs on the INIT thread, but pprocess_create set
+	 * pthread_self only on the MAIN thread (t). After snapshot
+	 * restore the INIT thread is current, so it needs pthread_self
+	 * too — otherwise signal handlers crash on NULL pprocess.
+	 */
+	{
+		struct uk_thread *_cur = uk_thread_current();
+		if (ictx->tmain && ictx->tmain != _cur) {
+			struct posix_thread *pt;
+			pt = uk_thread_uktls_var(ictx->tmain, pthread_self);
+			if (pt) {
+				pthread_self = pt;
+				hyperlight_init_pthread = pt;
+				hyperlight_init_pprocess = pt->process;
+				hyperlight_init_pthread_self_addr =
+					(__uptr)&pthread_self;
+			}
+		}
+	}
+#endif
+
 	ret = raise_process_clone_event(t, NULL);
 	if (unlikely(ret))
 		pprocess_release(p);
@@ -615,6 +659,10 @@ pid_t ukthread2tid(struct uk_thread *thread)
 	UK_ASSERT(thread);
 
 	pthread = uk_thread_uktls_var(thread, pthread_self);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!pthread)
+		pthread = hyperlight_init_pthread;
+#endif
 	if (!pthread)
 		return -ENOTSUP;
 
@@ -628,6 +676,10 @@ pid_t ukthread2pid(struct uk_thread *thread)
 	UK_ASSERT(thread);
 
 	pthread = uk_thread_uktls_var(thread, pthread_self);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (!pthread)
+		pthread = hyperlight_init_pthread;
+#endif
 	if (!pthread)
 		return -ENOTSUP;
 

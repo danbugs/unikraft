@@ -348,6 +348,9 @@ static void uk_signal_deliver(struct uk_syscall_exit_ctx *exit_ctx)
 	if (!pproc)
 		return;
 
+	if (!pproc->signal)
+		return;
+
 	/* If there's SIGKILL pending, kill the process right away */
 	if (IS_PENDING(pproc->signal->sigqueue, SIGKILL)) {
 		uk_pr_info("SIGKILL tid %d\n", uk_sys_gettid());
@@ -395,10 +398,16 @@ void sys_error_handler(struct ukarch_execenv *ee __unused, long arg)
 
 	/* Derive current process and thread */
 	pproc = uk_pprocess_current();
-	UK_ASSERT(pproc);
+	if (!pproc) {
+		UK_CRASH("[SYS-ERROR] pproc is NULL for sig=%d vaddr=0x%lx\n",
+			 error->signum, (unsigned long)error->vaddr);
+	}
 
 	pthread = uk_pthread_current();
-	UK_ASSERT(pthread);
+	if (!pthread) {
+		UK_CRASH("[SYS-ERROR] pthread is NULL for sig=%d vaddr=0x%lx\n",
+			 error->signum, (unsigned long)error->vaddr);
+	}
 
 	/* If there's a SIGKILL pending, kill the process right away */
 	if (IS_PENDING(pproc->signal->sigqueue, SIGKILL)) {

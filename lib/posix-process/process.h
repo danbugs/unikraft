@@ -103,6 +103,13 @@ extern struct posix_process *pid_process[TIDMAP_SIZE];
 
 extern __uk_tls struct posix_thread *pthread_self;
 
+#if CONFIG_PLAT_HYPERLIGHT
+extern struct posix_thread *hyperlight_init_pthread;
+extern struct uk_thread *hyperlight_vfork_parent_thread;
+extern struct posix_process *hyperlight_init_pprocess;
+extern volatile unsigned long *hyperlight_parent_pthread_self_addr;
+#endif
+
 #define uk_pprocess_foreach(_p)						\
 	for (int _j = 1, _i = 0; _i != ARRAY_SIZE(pid_process);		\
 		_j = !_j, _i++)						\

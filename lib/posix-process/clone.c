@@ -43,6 +43,9 @@
 #include <uk/lcpu.h>
 #include <uk/plat/config.h>
 #include <uk/process.h>
+#if CONFIG_PLAT_HYPERLIGHT && CONFIG_LIBPOSIX_PROCESS_SIGNAL
+#include "signal/signal.h"
+#endif
 #include <uk/print.h>
 #include <uk/syscall.h>
 #include <uk/arch/limits.h>
@@ -223,7 +226,6 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		flags |= CLONE_VM | CLONE_VFORK;
 		cl_args->flags |= CLONE_VM | CLONE_VFORK;
 	}
-
 	if (unlikely(flags & CLONE_CHILD_SETTID && !cl_args->child_tid))
 		return -EINVAL;
 
@@ -349,8 +351,51 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		    (void *) child->tlsp,
 		    (child->tlsp != child->uktlsp) ? "custom" : "Unikraft");
 
-	pprocess = uk_pprocess_current();
+	{
+		struct posix_thread *_pt = pthread_self;
+#if CONFIG_PLAT_HYPERLIGHT
+		if (!_pt)
+			_pt = hyperlight_init_pthread;
+#endif
+		UK_ASSERT(_pt);
+		pprocess = _pt->process;
+	}
 	UK_ASSERT(pprocess);
+#if CONFIG_PLAT_HYPERLIGHT
+	if (pprocess->children.next != &pprocess->children ||
+	    pprocess->children.prev != &pprocess->children) {
+		pprocess = hyperlight_init_pprocess;
+		if (!pprocess ||
+		    pprocess->children.next != &pprocess->children ||
+		    pprocess->children.prev != &pprocess->children) {
+			pprocess = uk_zalloc(uk_alloc_get_default(),
+					     sizeof(*pprocess));
+			UK_ASSERT(pprocess);
+			pprocess->_a = uk_alloc_get_default();
+			pprocess->pid = 1;
+			pprocess->state = POSIX_PROCESS_RUNNING;
+			UK_INIT_LIST_HEAD(&pprocess->threads);
+			UK_INIT_LIST_HEAD(&pprocess->children);
+			UK_INIT_LIST_HEAD(&pprocess->child_list_entry);
+			uk_semaphore_init(&pprocess->wait_semaphore, 0);
+			uk_semaphore_init(&pprocess->exit_semaphore, 0);
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+			pprocess_signal_pdesc_alloc(pprocess);
+			pprocess_signal_pdesc_init(pprocess);
+#endif
+			pid_process[1] = pprocess;
+			hyperlight_init_pprocess = pprocess;
+			if (hyperlight_init_pthread)
+				hyperlight_init_pthread->process = pprocess;
+			{
+				struct posix_thread *_cur_pt;
+				_cur_pt = uk_thread_uktls_var(t, pthread_self);
+				if (_cur_pt && _cur_pt != hyperlight_init_pthread)
+					_cur_pt->process = pprocess;
+			}
+		}
+	}
+#endif
 
 	if (cl_args->flags & CLONE_THREAD) {
 		pthread = pprocess_create_pthread(pprocess, child);
@@ -431,10 +476,45 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 	 * or exit(). Yield to schedule the child.
 	 */
 	if (flags & CLONE_VFORK) {
-		pthread = tid2pthread(ukthread2tid(t));
-		uk_thread_block(t);
-		pthread->state = POSIX_THREAD_BLOCKED_VFORK;
+		struct posix_thread *parent_pt = pthread_self;
+		__u64 parent_rsp;
+		void *stack_save;
+		/* fork is promoted to vfork (CLONE_VM): the child shares
+		 * the parent's userspace stack.  Between _Fork()'s return
+		 * and execve(), the child's glibc code calls close(),
+		 * rt_sigaction(), child_exec(), etc. which corrupt the
+		 * parent's stack frame (return addresses, canaries, locals).
+		 * Save the parent's stack region and restore it after the
+		 * child calls execve or _exit.
+		 */
+#define VFORK_STACK_SAVE_SZ 8192
+
+#if CONFIG_PLAT_HYPERLIGHT
+		if (!parent_pt)
+			parent_pt = hyperlight_init_pthread;
+#endif
+		UK_ASSERT(parent_pt);
+
+		parent_rsp = uk_lcpu_regs_get(execenv->regs, SP);
+		stack_save = uk_malloc(s->a, VFORK_STACK_SAVE_SZ);
+		UK_ASSERT(stack_save);
+		memcpy(stack_save, (void *)parent_rsp, VFORK_STACK_SAVE_SZ);
+
+#if CONFIG_PLAT_HYPERLIGHT
+		hyperlight_vfork_parent_thread = t;
+		hyperlight_parent_pthread_self_addr =
+			(volatile unsigned long *)&pthread_self;
+#endif
+		parent_pt->state = POSIX_THREAD_BLOCKED_VFORK;
 		uk_sched_yield();
+#if CONFIG_PLAT_HYPERLIGHT
+		while (hyperlight_vfork_parent_thread != NULL)
+			uk_sched_yield();
+#endif
+
+		memcpy((void *)parent_rsp, stack_save, VFORK_STACK_SAVE_SZ);
+		uk_free(s->a, stack_save);
+
 		goto out;
 	}
 
