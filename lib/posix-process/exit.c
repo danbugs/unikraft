@@ -243,17 +243,27 @@ void pprocess_exit(struct posix_process *pprocess,
  */
 UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 {
-#if CONFIG_PLAT_HYPERLIGHT
-	uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-#else
 	struct posix_thread *this_pthread;
 	struct uk_thread *this_thread;
 
 	this_thread = uk_thread_current();
 	this_pthread = uk_thread_uktls_var(this_thread, pthread_self);
 
-	UK_ASSERT(this_pthread);
+	if (!this_pthread) {
+#if CONFIG_PLAT_HYPERLIGHT
+		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+#else
+		uk_sched_thread_exit();
+#endif
+	}
+
 	UK_ASSERT(this_pthread->process);
+
+#if CONFIG_PLAT_HYPERLIGHT
+	if (this_pthread->process->pid == 1
+	    && uk_list_is_singular(&this_pthread->process->threads))
+		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+#endif
 
 	/* Last thread, exit the process */
 	if (uk_list_is_singular(&this_pthread->process->threads)) {
@@ -264,26 +274,34 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 
 	pprocess_exit_pthread(this_pthread, POSIX_THREAD_EXITED, status);
 	uk_sched_thread_exit();
-#endif
 }
 
 UK_LLSYSCALL_R_DEFINE(int, exit_group, int, status)
 {
-#if CONFIG_PLAT_HYPERLIGHT
-	/* On Hyperlight, go directly to ukplat_terminate to ensure
-	 * the void result is pushed to the output buffer before halt.
-	 * The scheduler's idle path would do a bare hlt instead.
-	 */
-	uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-#else
+	struct posix_thread *this_pthread;
 	struct posix_process *pprocess;
 
-	pprocess = uk_pprocess_current();
+	this_pthread = uk_pthread_current();
+
+	if (!this_pthread) {
+#if CONFIG_PLAT_HYPERLIGHT
+		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+#else
+		uk_sched_thread_exit();
+#endif
+	}
+
+	pprocess = this_pthread->process;
 	UK_ASSERT(pprocess);
+
+#if CONFIG_PLAT_HYPERLIGHT
+	if (pprocess->pid == 1
+	    && uk_list_is_singular(&pprocess->threads))
+		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+#endif
 
 	pprocess_exit(pprocess, POSIX_PROCESS_EXITED, status);
 	uk_sched_thread_exit();
-#endif
 }
 #else /* !CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */
 __noreturn void pprocess_exit_stub(int status)

@@ -399,7 +399,8 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		    t, t->name ? child->name : "<unnamed>",
 		    child, child->name ? child->name : "<unnamed>", ret);
 
-	clone_setup_child_ctx(execenv, child, (__uptr)stack);
+	clone_setup_child_ctx(execenv, child, (__uptr)stack,
+			      !!(flags & CLONE_VFORK));
 
 	uk_thread_set_runnable(child);
 

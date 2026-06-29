@@ -341,10 +341,12 @@ static void uk_signal_deliver(struct uk_syscall_exit_ctx *exit_ctx)
 		return;
 
 	pthread = uk_pthread_current();
-	UK_ASSERT(pthread);
+	if (!pthread)
+		return;
 
-	pproc = uk_pprocess_current();
-	UK_ASSERT(pproc);
+	pproc = pthread->process;
+	if (!pproc)
+		return;
 
 	/* If there's SIGKILL pending, kill the process right away */
 	if (IS_PENDING(pproc->signal->sigqueue, SIGKILL)) {
