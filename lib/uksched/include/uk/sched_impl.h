@@ -116,6 +116,13 @@ void uk_sched_thread_switch(struct uk_thread *next)
 	 */
 	uk_lcpu_tlsp_set(next->tlsp);
 
+#if CONFIG_PLAT_HYPERLIGHT
+	{
+		extern __uptr hyperlight_kernel_fsbase;
+		hyperlight_kernel_fsbase = next->uktlsp;
+	}
+#endif
+
 	uk_lcpu_set_auxsp(next->auxsp);
 
 	/**
