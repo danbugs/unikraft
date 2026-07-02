@@ -171,21 +171,16 @@ void pprocess_exit(struct posix_process *pprocess,
 	parent_process = pprocess->parent;
 
 #if CONFIG_LIBPOSIX_PROCESS_SIGNAL
-	/* As this will be signaling the parent on behalf of the current
-	 * pthread, we must do this before we terminate the pthreads, in
-	 * case we are called from _exit(), exit_group() (i.e. operate on
-	 * current).
-	 */
+#if CONFIG_PLAT_HYPERLIGHT
+	if (parent_process && pprocess->pid <= 2) {
+#else
 	if (parent_process) {
+#endif
 		ret = signal_exit(parent_process);
 		if (ret > 0) {
-			/* From exit(2): "If the parent has set SA_NOCLDWAIT, or
-			 * has set the SIGCHLD handler to SIG_IGN, the status is
-			 * discarded and the child dies immediately."
-			 */
 			uk_pr_info("Parent ignores SIGHLD, terminating\n");
 			nowait = true;
-		} else if (unlikely(ret < 0)) { /* no choice here but crash */
+		} else if (unlikely(ret < 0)) {
 			UK_CRASH("Could not signal parent (%d)\n", ret);
 		}
 	}
