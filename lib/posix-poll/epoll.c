@@ -660,83 +660,6 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 	uk_sched_yield();
 #endif /* CONFIG_LIBPOSIX_POLL_YIELD */
 
-#if CONFIG_PLAT_HYPERLIGHT
-#if CONFIG_LIBHOSTSOCK
-	extern int hostsock_rescan_events(void);
-#endif
-	extern void time_block_until(__snsec until);
-
-	for (;;) {
-#if CONFIG_LIBHOSTSOCK
-		hostsock_rescan_events();
-#endif
-		{
-			int nout = 0;
-			int lvlev = 0;
-
-			uk_file_rlock(epf);
-			for (struct epoll_entry *p = *list;
-			     p && nout < maxevents;
-			     p = p->next) {
-				unsigned int revents;
-				unsigned int *revp;
-#if CONFIG_LIBVFSCORE
-				if (p->legacy)
-					revp = &p->legacy_cb.revents;
-				else
-#endif
-					revp = &p->revents;
-				revents = uk_exchange_n(revp, 0);
-				if (!revents) {
-					unsigned int mask;
-
-					mask = events2mask(p->event.events);
-#if CONFIG_LIBVFSCORE
-					if (p->legacy) {
-						vfs_poll(p->vf, &revents,
-							 &p->legacy_cb.ecb);
-						revents &= mask;
-					} else
-#endif
-					{
-						revents = uk_file_poll_immediate(
-							p->f, mask);
-					}
-				}
-				if (revents) {
-					if (!IS_EDGEPOLL(p)) {
-						lvlev = 1;
-						(void)uk_or(revp, revents);
-					}
-					events[nout].events = revents;
-					events[nout].data = p->event.data;
-					nout++;
-				}
-			}
-			uk_file_runlock(epf);
-
-			if (lvlev || nout == maxevents)
-				uk_file_event_set(epf, UKFD_POLLIN);
-			if (nout)
-				return nout;
-		}
-
-		if (deadline
-		    && (__snsec)ukplat_monotonic_clock() >= (__snsec)deadline)
-			break;
-		if (!deadline && !*list)
-			break;
-		{
-			__snsec now = (__snsec)ukplat_monotonic_clock();
-			__snsec cap = now + 100000000LL;
-			__snsec until = deadline ? deadline : cap;
-
-			if (until > cap)
-				until = cap;
-			time_block_until(until);
-		}
-	}
-#else
 	while (uk_file_poll_until(epf, UKFD_POLLIN, deadline)) {
 		int lvlev = 0;
 		int nout = 0;
@@ -796,7 +719,6 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 			return nout;
 		/* If nout == 0 loop back around */
 	}
-#endif /* CONFIG_PLAT_HYPERLIGHT */
 	/* Timeout */
 	return 0;
 }
