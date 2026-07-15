@@ -321,7 +321,9 @@ static int hl_dispatch_peek_input(const __u8 **out_data, __sz *out_len)
 void __attribute__((used))
 hyperlight_dispatch_inner(void)
 {
+	uk_pr_info("dispatch: entered dispatch_inner\n");
 	hyperlight_dispatch_prepare();
+	uk_pr_info("dispatch: prepare done\n");
 
 	{
 		__u64 rbp_val = (__u64)__builtin_frame_address(0);
@@ -363,10 +365,13 @@ hyperlight_dispatch_inner(void)
 				 : : "c"(0xC0000100), "a"(lo), "d"(hi));
 	}
 
+	uk_pr_info("dispatch: cb=%p run=%p peeked=%d\n",
+		   (void *)g_dispatch_callback, (void *)g_run_callback, peeked);
 	if (g_dispatch_callback) {
 		if (peeked == 0)
 			g_dispatch_callback(fc_bytes, fc_len);
 	} else if (g_run_callback) {
+		uk_pr_info("dispatch: calling run_callback\n");
 		g_run_callback();
 	}
 
