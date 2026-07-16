@@ -101,17 +101,10 @@ int mmap_region_is_accessible(__u64 addr)
 	struct mmap_addr *tmp = mmap_addr;
 
 	while (tmp) {
-		if ((__u64)tmp->begin <= addr && addr < (__u64)tmp->end) {
-			if (tmp->prot == PROT_NONE)
-				uk_pr_crit("MMAP: addr=0x%llx in PROT_NONE "
-					   "[0x%lx-0x%lx)\n", addr,
-					   (unsigned long)tmp->begin,
-					   (unsigned long)tmp->end);
+		if ((__u64)tmp->begin <= addr && addr < (__u64)tmp->end)
 			return tmp->prot != PROT_NONE;
-		}
 		tmp = tmp->next;
 	}
-	uk_pr_crit("MMAP: addr=0x%llx NOT in any region\n", addr);
 	return 0;
 }
 #endif

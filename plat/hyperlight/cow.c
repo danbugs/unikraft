@@ -36,7 +36,6 @@
 static __u64 cow_scratch_base_gpa;
 static __u64 cow_scratch_base_gva;
 static __u64 cow_scratch_size;
-static __u64 cow_alloc_initial;
 static int   cow_initialized;
 
 extern int mmap_region_is_accessible(__u64 addr);
@@ -622,15 +621,9 @@ static int hyperlight_cow_pf_handler(void *data)
 			   (unsigned long)fault_addr);
 	}
 
-	{
-		volatile __u64 *ap = (volatile __u64 *)ALLOCATOR_GVA;
-		uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx "
-			   "rsp=0x%lx scratch_used=%lluMiB\n",
-			   (unsigned long)fault_addr, error_code,
-			   uk_lcpu_regs_get(regs, RIP),
-			   uk_lcpu_regs_get(regs, RSP),
-			   (*ap - cow_scratch_base_gpa) >> 20);
-	}
+	uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx\n",
+		   (unsigned long)fault_addr, error_code,
+		   uk_lcpu_regs_get(regs, RIP));
 	return UK_EVENT_NOT_HANDLED;
 }
 
@@ -654,11 +647,5 @@ void hyperlight_cow_init(void)
 	cow_scratch_base_gpa = HL_MAX_GPA - scratch_size + 1;
 	cow_scratch_base_gva = HL_MAX_GVA - scratch_size + 1;
 	cow_scratch_size = scratch_size;
-	cow_alloc_initial = *(volatile __u64 *)ALLOCATOR_GVA;
 	cow_initialized = 1;
-	uk_pr_crit("COW: scratch base=0x%llx size=%lluMiB "
-		   "alloc_start=0x%llx free=%lluMiB\n",
-		   cow_scratch_base_gpa, scratch_size >> 20,
-		   cow_alloc_initial,
-		   (cow_scratch_base_gpa + scratch_size - cow_alloc_initial) >> 20);
 }
