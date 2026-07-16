@@ -34,12 +34,20 @@ int sys_error_handler_except(int signum,
 	curr_sp = uk_lcpu_regs_get(uk_lcpu_except_err_ctx_get_regs(trap_ctx),
 				   SP);
 
-	/* If there is no auxsp, the fault happened during boot before
-	 * an aux stack is set up. If, however, we are executing in auxsp
-	 * then we know fore sure we are in uk context (not application).
-	 */
-	if (!auxsp || SP_IN_AUXSP(curr_sp, auxsp))
+	if (!auxsp) {
+		uk_pr_crit("SIG_EXCEPT: auxsp=NULL sig=%d\n", signum);
 		return UK_EVENT_NOT_HANDLED;
+	}
+	if (SP_IN_AUXSP(curr_sp, auxsp)) {
+		uk_pr_crit("SIG_EXCEPT: SP_IN_AUXSP sp=0x%lx auxsp=0x%lx sig=%d\n",
+			   (unsigned long)curr_sp, (unsigned long)auxsp,
+			   signum);
+		return UK_EVENT_NOT_HANDLED;
+	}
+
+	uk_pr_crit("SIG_EXCEPT: delivering sig=%d auxsp=0x%lx sp=0x%lx vaddr=0x%lx\n",
+		   signum, (unsigned long)auxsp, (unsigned long)curr_sp,
+		   (unsigned long)uk_lcpu_except_err_ctx_get_fault_addr(trap_ctx));
 
 	/* Prepare execution stack. Use the aux stack, as it's
 	 * the stack handle_self() expects to be opreating on.

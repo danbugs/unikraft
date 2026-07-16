@@ -417,6 +417,23 @@ void sys_error_handler(struct ukarch_execenv *ee __unused, long arg)
 	/* Now we can enable IRQs */
 	uk_lcpu_enable_irq();
 
+#if CONFIG_PLAT_HYPERLIGHT
+	/* Restore IST for page fault exceptions.
+	 * The except handler clears PF IST to prevent re-entry corruption
+	 * during nested faults (e.g. CoW). When we jump away via
+	 * ukarch_ctx_jump, the except handler's restore path is skipped.
+	 * Without IST, a subsequent page fault runs on the user stack, so
+	 * uk_lcpu_get_current_idx_in_except() computes a garbage CPU index
+	 * and reads auxsp=NULL, crashing the VM.
+	 */
+	{
+		struct { __u16 limit; __u64 base; } __packed idtr;
+
+		__asm__ volatile("sidt %0" : "=m"(idtr));
+		*((__u8 *)(idtr.base + 14 * 16 + 4)) = 2;
+	}
+#endif
+
 	/* Get arg */
 	error = (struct sys_error_desc *)arg;
 	UK_ASSERT(error);
@@ -467,11 +484,27 @@ void sys_error_handler(struct ukarch_execenv *ee __unused, long arg)
 	 * Being a unikernel, we treat this as a non-recoverable
 	 * error instead.
 	 */
-	if (!pprocess_signal_is_deliverable(pthread, error->signum))
+	if (!pprocess_signal_is_deliverable(pthread, error->signum)) {
+		uk_pr_crit("SIG_DELIVER: not deliverable sig=%d masked=%d ignored=%d handler=0x%lx pid=%lu vaddr=0x%lx\n",
+			   error->signum,
+			   IS_MASKED(pthread, error->signum),
+			   IS_IGNORED(pproc, error->signum),
+			   (unsigned long)KERN_SIGACTION(pproc, error->signum)->ks_handler,
+			   (unsigned long)pproc->pid,
+			   (unsigned long)error->vaddr);
 		goto err_panic;
+	}
 
-	if (KERN_SIGACTION(pproc, error->signum)->ks_handler == SIG_DFL)
+	if (KERN_SIGACTION(pproc, error->signum)->ks_handler == SIG_DFL) {
+		uk_pr_crit("SIG_DELIVER: handler=SIG_DFL sig=%d vaddr=0x%lx\n",
+			   error->signum, (unsigned long)error->vaddr);
 		goto err_panic;
+	}
+
+	uk_pr_crit("SIG_DELIVER: delivering sig=%d handler=0x%lx vaddr=0x%lx\n",
+		   error->signum,
+		   (unsigned long)KERN_SIGACTION(pproc, error->signum)->ks_handler,
+		   (unsigned long)error->vaddr);
 
 	/* Prepare siginfo */
 	set_siginfo_kill(error->signum, &sig.siginfo);
