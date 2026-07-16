@@ -20,6 +20,7 @@
 #include <uk/posix-poll.h>
 #include <uk/timeutil.h>
 #include <uk/syscall.h>
+#include <uk/sched.h>
 
 #if CONFIG_LIBVFSCORE
 #include <vfscore/file.h>
@@ -586,6 +587,9 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 		deadline = 0;
 	}
 
+
+	uk_sched_yield();
+
 	for (;;) {
 		int nout = 0;
 
@@ -606,6 +610,19 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 				revp = &p->revents;
 
 			revents = uk_exchange_n(revp, 0);
+
+			if (!IS_EDGEPOLL(p)
+#if CONFIG_LIBVFSCORE
+			    && !p->legacy
+#endif
+			) {
+				unsigned int mask;
+
+				mask = events2mask(p->event.events);
+				revents |= uk_file_poll_immediate(p->f,
+								  mask);
+			}
+
 			if (revents) {
 				events[nout].events = revents;
 				events[nout].data = p->event.data;
@@ -627,6 +644,7 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 
 			if (until > cap)
 				until = cap;
+			uk_sched_yield();
 			time_block_until(until);
 		}
 	}
