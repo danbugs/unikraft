@@ -79,7 +79,6 @@ MMAP_TIMING_EXPORT __u64 mmap_timing_pread_bytes;
  * entry, causing an unhandled "not present" page fault.
  */
 static __u64 mmap_virt_next = 0x800000000ULL; /* 32 GiB — above any heap */
-extern __u64 mmap_lazy_limit;
 
 extern int cow_demand_map_page(__u64 gva);
 extern int cow_demand_map_page_ex(__u64 gva, int zero_data);
@@ -90,10 +89,25 @@ struct mmap_addr {
 	void *begin;
 	void *end;
 	unsigned long num_pages; /* pages passed to uk_palloc; used by munmap */
+	int prot;
 	struct mmap_addr *next;
 };
 
 static struct mmap_addr *mmap_addr;
+
+#if CONFIG_PLAT_HYPERLIGHT
+int mmap_region_is_accessible(__u64 addr)
+{
+	struct mmap_addr *tmp = mmap_addr;
+
+	while (tmp) {
+		if ((__u64)tmp->begin <= addr && addr < (__u64)tmp->end)
+			return tmp->prot != PROT_NONE;
+		tmp = tmp->next;
+	}
+	return 0;
+}
+#endif
 
 /**
  * This is not a correct implementation of mmap. It is just a trick that works
@@ -212,6 +226,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 		new->begin = mem;
 		new->end = mem + len;
 		new->num_pages = 0; /* virtual-only: no buddy pages to free */
+		new->prot = prot;
 		new->next = NULL;
 		if (!mmap_addr)
 			mmap_addr = new;
@@ -222,13 +237,15 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 		mmap_timing_calls++;
 
 		if (prot != PROT_NONE) {
-			if (!cow_map_contiguous((__u64)mem,
-					       aligned_len / __PAGE_SIZE,
-					       1)) {
-				mmap_virt_next -= aligned_len;
-				uk_free(uk_alloc_get_default(), new);
-				errno = ENOMEM;
-				return MAP_FAILED;
+			if (fildes != -1) {
+				if (!cow_map_contiguous((__u64)mem,
+						       aligned_len / __PAGE_SIZE,
+						       1)) {
+					mmap_virt_next -= aligned_len;
+					uk_free(uk_alloc_get_default(), new);
+					errno = ENOMEM;
+					return MAP_FAILED;
+				}
 			}
 			__u64 _t2 = ukplat_monotonic_clock();
 			mmap_timing_pgloop_ns += (_t2 - _t1);
@@ -480,6 +497,15 @@ UK_SYSCALL_R_DEFINE(int, mprotect, void*, addr, size_t, len, int, prot)
 		__u64 base = (__u64)addr & ~(__PAGE_SIZE - 1);
 		for (pg_off = 0; pg_off < aligned_len; pg_off += __PAGE_SIZE)
 			cow_demand_map_page(base + pg_off);
+		struct mmap_addr *tmp = mmap_addr;
+		while (tmp) {
+			if ((void *)addr >= tmp->begin &&
+			    (void *)addr < tmp->end) {
+				tmp->prot = prot;
+				break;
+			}
+			tmp = tmp->next;
+		}
 	}
 #endif
 	return 0;

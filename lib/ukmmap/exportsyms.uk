@@ -9,3 +9,4 @@ mmap_timing_pgloop_ns
 mmap_timing_pread_ns
 mmap_timing_pgloop_pages
 mmap_timing_pread_bytes
+mmap_region_is_accessible

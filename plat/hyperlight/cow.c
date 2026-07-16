@@ -38,7 +38,7 @@ static __u64 cow_scratch_base_gva;
 static __u64 cow_scratch_size;
 static int   cow_initialized;
 
-__u64 mmap_lazy_limit = 0x800000000ULL;
+extern int mmap_region_is_accessible(__u64 addr);
 
 static inline __u64 cow_phys_to_virt(__u64 gpa)
 {
@@ -602,23 +602,26 @@ static int hyperlight_cow_pf_handler(void *data)
 	if (!(error_code & 1) && cow_demand_map_file_page(fault_addr))
 		return UK_EVENT_HANDLED;
 
-	/* Lazy demand-paging for anonymous mmap regions */
+	/* Lazy demand-paging for anonymous mmap regions.
+	 * Only demand-map if the faulting address is in a region that was
+	 * mmap'd with non-PROT_NONE protection. V8's 1 TiB PROT_NONE
+	 * sandbox expects SIGSEGV on uncommitted pages — demand-mapping
+	 * those would waste scratch and break sandbox bounds checking.
+	 */
 	if (!(error_code & 1) &&
 	    fault_addr >= 0x800000000ULL &&
-	    fault_addr < mmap_lazy_limit) {
+	    mmap_region_is_accessible(fault_addr)) {
 		int dm_rc = cow_demand_map_page(fault_addr);
 		if (dm_rc)
 			return UK_EVENT_HANDLED;
-		uk_pr_crit("PF DEMAND-MAP FAILED: addr=0x%lx limit=0x%llx\n",
-			   (unsigned long)fault_addr, mmap_lazy_limit);
+		uk_pr_crit("PF DEMAND-MAP FAILED: addr=0x%lx\n",
+			   (unsigned long)fault_addr);
 	}
 
-	uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx rsp=0x%lx "
-		   "lazy_limit=0x%llx\n",
+	uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx rsp=0x%lx\n",
 		   (unsigned long)fault_addr, error_code,
 		   uk_lcpu_regs_get(regs, RIP),
-		   uk_lcpu_regs_get(regs, RSP),
-		   mmap_lazy_limit);
+		   uk_lcpu_regs_get(regs, RSP));
 	return UK_EVENT_NOT_HANDLED;
 }
 
