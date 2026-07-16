@@ -40,10 +40,22 @@ struct hostsock_data {
 	int nonblock;
 };
 
-/* Static per-call buffers. Not thread-safe; callers serialise via
- * posix-socket and vfscore locking. */
+/* Static per-call buffers — protected by rpc_lock for CLONE_VM safety. */
 static char rpc_req[HOSTSOCK_RPC_MAX];
 static char rpc_resp[HOSTSOCK_RPC_MAX];
+
+static volatile int _rpc_lock;
+
+static inline void rpc_lock(void)
+{
+	while (__sync_lock_test_and_set(&_rpc_lock, 1))
+		__asm__ volatile("pause" ::: "memory");
+}
+
+static inline void rpc_unlock(void)
+{
+	__sync_lock_release(&_rpc_lock);
+}
 
 /* Static scatter/gather buffer for sendmsg/recvmsg multi-iovec
  * flattening.  Stack allocation (32 KB) is unsafe on 64 KB stacks. */
@@ -251,10 +263,12 @@ static int json_get_string(const char *json, const char *key,
 static int rpc_exchange(size_t req_len, size_t *resp_len)
 {
 	__sz rlen = 0;
+	rpc_lock();
 	int rc = hyperlight_hcall((const __u8 *)rpc_req, req_len,
 				  (__u8 *)rpc_resp,
 				  sizeof(rpc_resp) - 1, &rlen);
 	if (rc < 0) {
+		rpc_unlock();
 		uk_pr_err("hostsock: hcall failed: %d\n", rc);
 		return -EIO;
 	}
@@ -262,9 +276,11 @@ static int rpc_exchange(size_t req_len, size_t *resp_len)
 	if (resp_len) *resp_len = rlen;
 	if (json_has_error(rpc_resp)) {
 		int e = json_errno(rpc_resp);
+		rpc_unlock();
 		uk_pr_crit("hostsock: RPC error (%d): %s\n", e, rpc_resp);
 		return e;
 	}
+	rpc_unlock();
 	return 0;
 }
 
