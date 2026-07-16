@@ -621,9 +621,13 @@ static int hyperlight_cow_pf_handler(void *data)
 			   (unsigned long)fault_addr);
 	}
 
-	uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx\n",
-		   (unsigned long)fault_addr, error_code,
-		   uk_lcpu_regs_get(regs, RIP));
+	{
+		extern int uk_sys_getpid(void);
+		uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx pid=%d\n",
+			   (unsigned long)fault_addr, error_code,
+			   uk_lcpu_regs_get(regs, RIP),
+			   uk_sys_getpid());
+	}
 	return UK_EVENT_NOT_HANDLED;
 }
 
