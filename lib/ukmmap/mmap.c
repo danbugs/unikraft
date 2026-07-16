@@ -79,6 +79,7 @@ MMAP_TIMING_EXPORT __u64 mmap_timing_pread_bytes;
  * entry, causing an unhandled "not present" page fault.
  */
 static __u64 mmap_virt_next = 0x800000000ULL; /* 32 GiB — above any heap */
+extern __u64 mmap_lazy_limit;
 
 extern int cow_demand_map_page(__u64 gva);
 extern int cow_demand_map_page_ex(__u64 gva, int zero_data);
@@ -158,10 +159,6 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 					     pg_off += __PAGE_SIZE)
 						cow_demand_map_page(
 							(__u64)addr + pg_off);
-					/* File-backed: read content into the
-					 * newly mapped pages.
-					 * Anonymous: zero-fill BSS pages.
-					 */
 					if (fildes != -1)
 						pread(fildes, addr, len, off);
 					else
@@ -224,41 +221,15 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 		mmap_timing_bookkeep_ns += (_t1 - _t0);
 		mmap_timing_calls++;
 
-		/* For non-PROT_NONE, eagerly demand-map all pages. For
-		 * file-backed mappings, skip the per-page zero-fill — the
-		 * pread below overwrites every byte anyway, so the memset
-		 * is pure memory-bandwidth waste. Saves ~0.4 us/page on a
-		 * Python-import hot path that averages 40+ pages/mmap and
-		 * 700+ mmaps per `import pandas`.
-		 */
 		if (prot != PROT_NONE) {
-			/* Always zero the freshly-mapped pages. The earlier
-			 * "skip zero-fill for file-backed mmaps" optimisation
-			 * turned out to have two holes:
-			 *   1) len past EOF had to be zeroed per POSIX (fixed
-			 *      with a tail memset below), and
-			 *   2) physical pages recycled from recently-munmapped
-			 *      mappings still had the previous mapping's data,
-			 *      producing non-zero bytes in the middle of the
-			 *      new mapping where pread() never wrote.
-			 * (2) was the root cause of powershell crashing during
-			 * startup. Reverting to always-zero costs ~3-5 ms per
-			 * `import pandas` (measured) which is cheap compared
-			 * to the bugs it prevents. A future optimisation could
-			 * zero only the physical pages not sourced from a clean
-			 * pool, but for now correctness wins.
-			 */
-			int zero_data = 1;
-			/* One contiguous physical allocation + single
-			 * memset (for anonymous) + per-page PTE writes —
-			 * replaces the N-per-page (alloc + memset + PTE
-			 * write) that the naive loop was doing. Giant
-			 * win on anonymous mmaps where the memset alone
-			 * was eating 120+ ms per Python startup.
-			 */
-			cow_map_contiguous((__u64)mem,
-					   aligned_len / __PAGE_SIZE,
-					   zero_data);
+			if (!cow_map_contiguous((__u64)mem,
+					       aligned_len / __PAGE_SIZE,
+					       1)) {
+				mmap_virt_next -= aligned_len;
+				uk_free(uk_alloc_get_default(), new);
+				errno = ENOMEM;
+				return MAP_FAILED;
+			}
 			__u64 _t2 = ukplat_monotonic_clock();
 			mmap_timing_pgloop_ns += (_t2 - _t1);
 			mmap_timing_pgloop_pages +=

@@ -35,7 +35,10 @@
 
 static __u64 cow_scratch_base_gpa;
 static __u64 cow_scratch_base_gva;
+static __u64 cow_scratch_size;
 static int   cow_initialized;
+
+__u64 mmap_lazy_limit = 0x800000000ULL;
 
 static inline __u64 cow_phys_to_virt(__u64 gpa)
 {
@@ -166,6 +169,16 @@ int cow_handle_fault(__u64 fault_addr, unsigned long error_code,
 		return 0;
 
 	/* Allocate new page from scratch and copy content */
+	{
+		volatile __u64 *ap = (volatile __u64 *)ALLOCATOR_GVA;
+		__u64 alloc_end = *ap + HL_PAGE_SIZE;
+		__u64 scratch_end = cow_scratch_base_gpa + cow_scratch_size;
+		if (alloc_end > scratch_end) {
+			uk_pr_crit("COW_FAULT: SCRATCH EXHAUSTED at "
+				   "fault_addr=0x%llx\n", fault_addr);
+			return 0;
+		}
+	}
 	new_page_gpa = cow_alloc_phys_pages(1);
 	new_page_gva = cow_phys_to_virt(new_page_gpa);
 	page_start = fault_addr & ~(HL_PAGE_SIZE - 1);
@@ -210,8 +223,21 @@ int cow_demand_map_page_ex(__u64 gva, int zero_data)
 	__u64 entry_addr, entry_val;
 	__u64 next_base;
 
-	if (!cow_initialized)
+	if (!cow_initialized) {
+		uk_pr_crit("DEMAND_MAP: not initialized gva=0x%llx\n", gva);
 		return 0;
+	}
+
+	{
+		volatile __u64 *ap = (volatile __u64 *)ALLOCATOR_GVA;
+		__u64 alloc_end = *ap + 4 * HL_PAGE_SIZE;
+		if (alloc_end > cow_scratch_base_gpa + cow_scratch_size) {
+			uk_pr_crit("DEMAND_MAP: SCRATCH EXHAUSTED gva=0x%llx alloc=0x%llx end=0x%llx\n",
+				   gva, alloc_end,
+				   cow_scratch_base_gpa + cow_scratch_size);
+			return 0;
+		}
+	}
 
 	cr3 = cow_read_cr3();
 	addr = gva & ((1ULL << 48) - 1);
@@ -377,6 +403,14 @@ int cow_map_contiguous(__u64 gva_base, __sz n_pages, int zero_data)
 	if (!cow_initialized || !n_pages)
 		return 0;
 
+	{
+		volatile __u64 *ap = (volatile __u64 *)ALLOCATOR_GVA;
+		__u64 alloc_end = *ap + n_pages * HL_PAGE_SIZE;
+		__u64 scratch_end = cow_scratch_base_gpa + cow_scratch_size;
+		if (alloc_end > scratch_end)
+			return 0;
+	}
+
 	/* One big physical allocation for the whole range. */
 	__u64 phys_base = cow_alloc_phys_pages(n_pages);
 
@@ -541,12 +575,24 @@ static int hyperlight_cow_pf_handler(void *data)
 	struct uk_lcpu_except_err_ctx *ctx = data;
 	__vaddr_t fault_addr;
 	int error_code;
-
-	if (!cow_initialized)
-		return UK_EVENT_NOT_HANDLED;
+	struct uk_lcpu_regs *regs;
 
 	fault_addr = (__vaddr_t)uk_lcpu_except_err_ctx_get_fault_addr(ctx);
 	error_code = uk_lcpu_x86_64_except_err_ctx_get_error_code(ctx);
+	regs = uk_lcpu_except_err_ctx_get_regs(ctx);
+
+	if (!cow_initialized) {
+		uk_pr_crit("PF: addr=0x%lx err=0x%x rip=0x%lx rsp=0x%lx "
+			   "rdi=0x%lx rsi=0x%lx rax=0x%lx "
+			   "cow_init=0\n",
+			   (unsigned long)fault_addr, error_code,
+			   uk_lcpu_regs_get(regs, RIP),
+			   uk_lcpu_regs_get(regs, RSP),
+			   uk_lcpu_regs_get(regs, RDI),
+			   uk_lcpu_regs_get(regs, RSI),
+			   uk_lcpu_regs_get(regs, RAX));
+		return UK_EVENT_NOT_HANDLED;
+	}
 
 	/* Try CoW resolution first (present + write faults) */
 	if (cow_handle_fault(fault_addr, (__u64)error_code, 0))
@@ -556,6 +602,23 @@ static int hyperlight_cow_pf_handler(void *data)
 	if (!(error_code & 1) && cow_demand_map_file_page(fault_addr))
 		return UK_EVENT_HANDLED;
 
+	/* Lazy demand-paging for anonymous mmap regions */
+	if (!(error_code & 1) &&
+	    fault_addr >= 0x800000000ULL &&
+	    fault_addr < mmap_lazy_limit) {
+		int dm_rc = cow_demand_map_page(fault_addr);
+		if (dm_rc)
+			return UK_EVENT_HANDLED;
+		uk_pr_crit("PF DEMAND-MAP FAILED: addr=0x%lx limit=0x%llx\n",
+			   (unsigned long)fault_addr, mmap_lazy_limit);
+	}
+
+	uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx rsp=0x%lx "
+		   "lazy_limit=0x%llx\n",
+		   (unsigned long)fault_addr, error_code,
+		   uk_lcpu_regs_get(regs, RIP),
+		   uk_lcpu_regs_get(regs, RSP),
+		   mmap_lazy_limit);
 	return UK_EVENT_NOT_HANDLED;
 }
 
@@ -578,5 +641,6 @@ void hyperlight_cow_init(void)
 
 	cow_scratch_base_gpa = HL_MAX_GPA - scratch_size + 1;
 	cow_scratch_base_gva = HL_MAX_GVA - scratch_size + 1;
+	cow_scratch_size = scratch_size;
 	cow_initialized = 1;
 }
