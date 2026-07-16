@@ -120,6 +120,13 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
 	crash_printk("  (|O|)/V  \n");
 	crash_printk("           \n");
 	crash_print_crashdump(regs);
+	if (descr->reason == UK_CRASH_REASON_UNHANDLED_TRAP)
+		crash_printk("Trap: #%llu (%s) error_code=0x%llx\n",
+			     descr->arg1, (const char *)descr->arg2,
+			     descr->arg3);
+	else if (descr->reason == UK_CRASH_REASON_PAGE_FAULT)
+		crash_printk("Page fault: addr=0x%llx error_code=0x%llx\n",
+			     descr->arg1, descr->arg2);
 #endif /* CONFIG_LIBUKDEBUG_CRASH_SCREEN */
 
 	param.regs = regs;
