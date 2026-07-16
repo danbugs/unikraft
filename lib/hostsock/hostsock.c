@@ -45,6 +45,10 @@ struct hostsock_data {
 static char rpc_req[HOSTSOCK_RPC_MAX];
 static char rpc_resp[HOSTSOCK_RPC_MAX];
 
+/* Static scatter/gather buffer for sendmsg/recvmsg multi-iovec
+ * flattening.  Stack allocation (32 KB) is unsafe on 64 KB stacks. */
+static char iov_flat_buf[HOSTSOCK_RPC_MAX / 2];
+
 /* -------- base64 codec (same as hostfs) -------- */
 
 static const char b64_enc[] =
@@ -195,6 +199,8 @@ static int json_errno(const char *json)
 		return -EWOULDBLOCK;
 	if (strstr(p, "permission") || strstr(p, "Permission"))
 		return -EACCES;
+	if (strstr(p, "denies") || strstr(p, "policy"))
+		return -ECONNREFUSED;
 	if (strstr(p, "InvalidInput") || strstr(p, "Invalid argument"))
 		return -EINVAL;
 	if (strstr(p, "bad_fd"))
@@ -247,8 +253,11 @@ static int rpc_exchange(size_t req_len, size_t *resp_len)
 	}
 	rpc_resp[rlen] = '\0';
 	if (resp_len) *resp_len = rlen;
-	if (json_has_error(rpc_resp))
-		return json_errno(rpc_resp);
+	if (json_has_error(rpc_resp)) {
+		int e = json_errno(rpc_resp);
+		uk_pr_crit("hostsock: RPC error (%d): %s\n", e, rpc_resp);
+		return e;
+	}
 	return 0;
 }
 
@@ -491,6 +500,8 @@ static void *hostsock_create(struct posix_socket_driver *d,
 
 	uk_pr_debug("hostsock: create fd=%u (family=%d type=%d nb=%d)\n",
 		    sd->host_fd, family, sock_type, nonblock);
+	uk_pr_crit("hostsock: create fd=%u type=%d nb=%d\n",
+		   sd->host_fd, sock_type, nonblock);
 	return sd;
 }
 
@@ -582,16 +593,48 @@ static void *hostsock_accept4(posix_sock *sock,
 	return sd;
 }
 
+static int is_loopback(const struct sockaddr *addr)
+{
+	if (addr->sa_family == AF_INET) {
+		const unsigned char *b =
+			(const unsigned char *)&((const struct sockaddr_in *)addr)
+			->sin_addr.s_addr;
+		return b[0] == 127;
+	}
+	if (addr->sa_family == AF_INET6) {
+		const struct in6_addr *a =
+			&((const struct sockaddr_in6 *)addr)->sin6_addr;
+		static const unsigned char lo[16] =
+			{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+		return memcmp(a->s6_addr, lo, 16) == 0;
+	}
+	return 0;
+}
+
 static int hostsock_connect(posix_sock *sock,
 			    const struct sockaddr *addr, socklen_t addr_len)
 {
+	/* Loopback is always denied by host NetworkPolicy.  Silently
+	 * succeed so libuv probes (recvmmsg → 127.0.0.1:65535) don't
+	 * poison errno for other threads under cooperative scheduling. */
+	if (is_loopback(addr))
+		return 0;
+
 	char abuf[128];
 	sockaddr_to_json(addr, addr_len, abuf, sizeof(abuf));
 	int n = build_req(
 		"{\"name\":\"net_connect\",\"args\":{\"fd\":%u,%s}}",
 		get_host_fd(sock), abuf);
 	if (n < 0) return -ENOMEM;
-	return rpc_exchange(n, NULL);
+	int rc = rpc_exchange(n, NULL);
+	if (addr->sa_family == AF_INET) {
+		struct sockaddr_in *in = (struct sockaddr_in *)addr;
+		char ip[20]; ipv4_ntop(&in->sin_addr, ip, sizeof(ip));
+		uk_pr_crit("hostsock: connect fd=%u -> %s:%u rc=%d\n",
+			   get_host_fd(sock), ip,
+			   (unsigned)__builtin_bswap16(in->sin_port), rc);
+	}
+	return rc;
 }
 
 static ssize_t hostsock_sendto(posix_sock *sock,
@@ -631,6 +674,12 @@ static ssize_t hostsock_sendto(posix_sock *sock,
 	long long sent = 0;
 	if (json_get_int(rpc_resp, "sent", &sent) < 0)
 		return -EIO;
+	if (dest_addr && dest_addr->sa_family == AF_INET) {
+		struct sockaddr_in *in = (struct sockaddr_in *)dest_addr;
+		if (__builtin_bswap16(in->sin_port) == 53)
+			uk_pr_crit("hostsock: sendto fd=%u port=53 len=%zu sent=%lld\n",
+				   get_host_fd(sock), len, sent);
+	}
 	return (ssize_t)sent;
 }
 
@@ -692,24 +741,21 @@ static ssize_t hostsock_sendmsg(posix_sock *sock,
 	for (size_t i = 0; i < (size_t)msg->msg_iovlen; i++)
 		total += msg->msg_iov[i].iov_len;
 
-	/* Flatten iovecs into a contiguous buffer if needed */
 	if (msg->msg_iovlen == 1) {
 		return hostsock_sendto(sock, msg->msg_iov[0].iov_base,
 				      msg->msg_iov[0].iov_len, flags,
 				      msg->msg_name, msg->msg_namelen);
 	}
 
-	/* Multi-iovec: copy into temp buffer */
-	char tmp[HOSTSOCK_RPC_MAX / 2];
-	if (total > sizeof(tmp))
+	if (total > sizeof(iov_flat_buf))
 		return -EMSGSIZE;
 	size_t off = 0;
 	for (size_t i = 0; i < (size_t)msg->msg_iovlen; i++) {
-		memcpy(tmp + off, msg->msg_iov[i].iov_base,
+		memcpy(iov_flat_buf + off, msg->msg_iov[i].iov_base,
 		       msg->msg_iov[i].iov_len);
 		off += msg->msg_iov[i].iov_len;
 	}
-	return hostsock_sendto(sock, tmp, total, flags,
+	return hostsock_sendto(sock, iov_flat_buf, total, flags,
 			       msg->msg_name, msg->msg_namelen);
 }
 
@@ -726,11 +772,10 @@ static ssize_t hostsock_recvmsg(posix_sock *sock,
 					msg->msg_name, &msg->msg_namelen);
 	}
 
-	char tmp[HOSTSOCK_RPC_MAX / 2];
-	if (total > sizeof(tmp))
+	if (total > sizeof(iov_flat_buf))
 		return -EMSGSIZE;
 
-	ssize_t got = hostsock_recvfrom(sock, tmp, total, flags,
+	ssize_t got = hostsock_recvfrom(sock, iov_flat_buf, total, flags,
 					msg->msg_name, &msg->msg_namelen);
 	if (got <= 0)
 		return got;
@@ -742,7 +787,7 @@ static ssize_t hostsock_recvmsg(posix_sock *sock,
 		size_t chunk = msg->msg_iov[i].iov_len;
 		if (chunk > (size_t)got - off)
 			chunk = (size_t)got - off;
-		memcpy(msg->msg_iov[i].iov_base, tmp + off, chunk);
+		memcpy(msg->msg_iov[i].iov_base, iov_flat_buf + off, chunk);
 		off += chunk;
 	}
 	return got;
@@ -837,10 +882,32 @@ static ssize_t hostsock_read(posix_sock *sock,
 static ssize_t hostsock_write(posix_sock *sock,
 			      const struct iovec *iov, size_t iovcnt)
 {
+	/* 48000 raw bytes → ~64000 base64 bytes, fits in 65536-byte rpc_req
+	 * with room for the JSON header/trailer. */
+	static const size_t MAX_CHUNK = 48000;
+
 	if (iovcnt == 0)
 		return 0;
-	return hostsock_sendto(sock, iov[0].iov_base, iov[0].iov_len,
-			       0, NULL, 0);
+
+	ssize_t total = 0;
+	for (size_t i = 0; i < iovcnt; i++) {
+		const char *base = iov[i].iov_base;
+		size_t remaining = iov[i].iov_len;
+
+		while (remaining > 0) {
+			size_t chunk = remaining > MAX_CHUNK ? MAX_CHUNK : remaining;
+			ssize_t sent = hostsock_sendto(sock, base, chunk,
+						       0, NULL, 0);
+			if (sent < 0)
+				return total > 0 ? total : sent;
+			total += sent;
+			base += sent;
+			remaining -= (size_t)sent;
+			if ((size_t)sent < chunk)
+				return total;
+		}
+	}
+	return total;
 }
 
 static int hostsock_close(posix_sock *sock)
@@ -941,3 +1008,145 @@ static struct posix_socket_ops hostsock_ops = {
 
 POSIX_SOCKET_FAMILY_REGISTER(AF_INET, &hostsock_ops);
 POSIX_SOCKET_FAMILY_REGISTER(AF_INET6, &hostsock_ops);
+
+/* -------- host-side getaddrinfo -------- */
+
+#ifndef EAI_NONAME
+#define EAI_NONAME -2
+#define EAI_MEMORY -10
+#define EAI_SYSTEM -11
+#endif
+
+struct addrinfo {
+	int ai_flags;
+	int ai_family;
+	int ai_socktype;
+	int ai_protocol;
+	socklen_t ai_addrlen;
+	struct sockaddr *ai_addr;
+	char *ai_canonname;
+	struct addrinfo *ai_next;
+};
+
+int getaddrinfo(const char *node, const char *service,
+		const struct addrinfo *hints, struct addrinfo **res)
+{
+	uk_pr_crit("hostsock: getaddrinfo node=%s svc=%s\n",
+		   node ? node : "(null)", service ? service : "(null)");
+	if (!node)
+		return EAI_NONAME;
+
+	unsigned port = 0;
+	if (service)
+		port = (unsigned)strtoul(service, NULL, 10);
+
+	int n = build_req(
+		"{\"name\":\"net_getaddrinfo\",\"args\":"
+		"{\"host\":\"%s\",\"port\":%u}}",
+		node, port);
+	if (n < 0)
+		return EAI_MEMORY;
+
+	size_t resp_len;
+	if (rpc_exchange(n, &resp_len) < 0)
+		return EAI_SYSTEM;
+
+	const char *arr = json_scan_key(rpc_resp, "addrs");
+	if (!arr || *arr != '[')
+		return EAI_NONAME;
+	arr++;
+
+	struct addrinfo *head = NULL, **tail = &head;
+	while (*arr) {
+		while (*arr == ' ' || *arr == ',')
+			arr++;
+		if (*arr == ']')
+			break;
+		if (*arr != '{')
+			break;
+		arr++;
+
+		long long family = 2;
+		{
+			const char *fp = strstr(arr, "\"family\"");
+			if (fp) {
+				fp += 8;
+				while (*fp == ':' || *fp == ' ')
+					fp++;
+				family = strtoll(fp, NULL, 10);
+			}
+		}
+
+		char addr_str[64] = {0};
+		{
+			const char *ap = strstr(arr, "\"addr\":\"");
+			if (ap) {
+				ap += 8;
+				size_t i = 0;
+				while (*ap && *ap != '"' && i + 1 < sizeof(addr_str))
+					addr_str[i++] = *ap++;
+				addr_str[i] = '\0';
+			}
+		}
+
+		long long rport = port;
+		{
+			const char *pp = strstr(arr, "\"port\"");
+			if (pp) {
+				pp += 6;
+				while (*pp == ':' || *pp == ' ')
+					pp++;
+				rport = strtoll(pp, NULL, 10);
+			}
+		}
+
+		while (*arr && *arr != '}')
+			arr++;
+		if (*arr == '}')
+			arr++;
+
+		if (!addr_str[0])
+			continue;
+
+		struct addrinfo *ai = uk_calloc(uk_alloc_get_default(),
+						1, sizeof(*ai));
+		if (!ai)
+			break;
+
+		if (family == 2) {
+			struct sockaddr_in *sin = uk_calloc(
+				uk_alloc_get_default(), 1, sizeof(*sin));
+			if (!sin) { uk_free(uk_alloc_get_default(), ai); break; }
+			sin->sin_family = AF_INET;
+			sin->sin_port = __builtin_bswap16((uint16_t)rport);
+			ipv4_pton(addr_str, &sin->sin_addr);
+			ai->ai_family = AF_INET;
+			ai->ai_socktype = SOCK_STREAM;
+			ai->ai_addrlen = sizeof(*sin);
+			ai->ai_addr = (struct sockaddr *)sin;
+		} else {
+			uk_free(uk_alloc_get_default(), ai);
+			continue;
+		}
+
+		*tail = ai;
+		tail = &ai->ai_next;
+	}
+
+	if (!head)
+		return EAI_NONAME;
+
+	*res = head;
+	return 0;
+}
+
+void freeaddrinfo(struct addrinfo *res)
+{
+	while (res) {
+		struct addrinfo *next = res->ai_next;
+		if (res->ai_addr)
+			uk_free(uk_alloc_get_default(), res->ai_addr);
+		uk_free(uk_alloc_get_default(), res);
+		res = next;
+	}
+}
