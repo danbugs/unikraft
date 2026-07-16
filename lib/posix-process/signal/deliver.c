@@ -501,11 +501,6 @@ void sys_error_handler(struct ukarch_execenv *ee __unused, long arg)
 		goto err_panic;
 	}
 
-	uk_pr_crit("SIG_DELIVER: delivering sig=%d handler=0x%lx vaddr=0x%lx\n",
-		   error->signum,
-		   (unsigned long)KERN_SIGACTION(pproc, error->signum)->ks_handler,
-		   (unsigned long)error->vaddr);
-
 	/* Prepare siginfo */
 	set_siginfo_kill(error->signum, &sig.siginfo);
 

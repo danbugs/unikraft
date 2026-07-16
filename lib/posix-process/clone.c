@@ -550,13 +550,6 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		memcpy((void *)parent_rsp, stack_save, vfork_save_sz);
 		uk_free(s->a, stack_save);
 
-		uk_pr_crit("VFORK_DIAG: parent resumed, "
-			   "execenv_rip=0x%lx execenv_rsp=0x%lx "
-			   "execenv_rcx=0x%lx execenv_rax=0x%lx\n",
-			   uk_lcpu_regs_get(execenv->regs, RIP),
-			   uk_lcpu_regs_get(execenv->regs, RSP),
-			   uk_lcpu_regs_get(execenv->regs, RCX),
-			   uk_lcpu_regs_get(execenv->regs, RAX));
 		goto out;
 	}
 
