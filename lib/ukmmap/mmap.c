@@ -163,11 +163,11 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 		if (addr) {
 			if (addr >= tmp->begin && addr < tmp->end) {
 #if CONFIG_PLAT_HYPERLIGHT
-				/* MAP_FIXED commit within an existing reservation:
-				 * demand-map each page from scratch so the virtual
-				 * address is backed by a real, zeroed page.
+				/* Commit within an existing reservation (MAP_FIXED
+				 * or hint-based): demand-map each page from scratch
+				 * so the virtual address is backed by a real page.
 				 */
-				if ((flags & MAP_FIXED) && (prot != PROT_NONE)) {
+				if (prot != PROT_NONE) {
 					size_t pg_off;
 					for (pg_off = 0; pg_off < len;
 					     pg_off += __PAGE_SIZE)
