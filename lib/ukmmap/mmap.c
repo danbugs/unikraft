@@ -173,8 +173,13 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 				/* Commit within an existing reservation (MAP_FIXED
 				 * or hint-based): demand-map each page from scratch
 				 * so the virtual address is backed by a real page.
+				 * Track the sub-region with its actual protection so
+				 * that later page faults (e.g. from a child process
+				 * after vfork/execve) can be demand-mapped correctly.
 				 */
 				if (prot != PROT_NONE) {
+					size_t aligned_len = (len + __PAGE_SIZE - 1)
+							     & ~(__PAGE_SIZE - 1);
 					size_t pg_off;
 					for (pg_off = 0; pg_off < len;
 					     pg_off += __PAGE_SIZE)
@@ -184,6 +189,16 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 						pread(fildes, addr, len, off);
 					else
 						memset(addr, 0, len);
+					new = uk_malloc(uk_alloc_get_default(),
+							sizeof(struct mmap_addr));
+					if (new) {
+						new->begin = addr;
+						new->end = addr + aligned_len;
+						new->num_pages = 0;
+						new->prot = prot;
+						new->next = mmap_addr;
+						mmap_addr = new;
+					}
 				}
 #endif
 				return addr;
