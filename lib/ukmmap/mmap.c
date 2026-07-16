@@ -224,7 +224,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 
 		__u64 _t0 = ukplat_monotonic_clock();
 		new->begin = mem;
-		new->end = mem + len;
+		new->end = mem + aligned_len;
 		new->num_pages = 0; /* virtual-only: no buddy pages to free */
 		new->prot = prot;
 		new->next = NULL;
