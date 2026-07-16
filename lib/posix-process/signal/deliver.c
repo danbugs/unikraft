@@ -501,8 +501,19 @@ void sys_error_handler(struct ukarch_execenv *ee __unused, long arg)
 		goto err_panic;
 	}
 
-	/* Prepare siginfo */
-	set_siginfo_kill(error->signum, &sig.siginfo);
+	/* Prepare siginfo — use hardware-fault codes so signal handlers
+	 * (e.g. V8's SIGSEGV handler) can distinguish faults from kill().
+	 */
+	sig.siginfo.si_signo = error->signum;
+	if (error->signum == SIGSEGV) {
+		sig.siginfo.si_code = SEGV_MAPERR;
+		sig.siginfo.si_addr = (void *)error->vaddr;
+	} else if (error->signum == SIGBUS) {
+		sig.siginfo.si_code = BUS_ADRERR;
+		sig.siginfo.si_addr = (void *)error->vaddr;
+	} else {
+		sig.siginfo.si_code = SI_KERNEL;
+	}
 
 	/* Execute standard delivery path */
 	do_deliver(pthread, &sig, ee);
