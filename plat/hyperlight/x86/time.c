@@ -27,12 +27,14 @@ __nsec ukplat_monotonic_clock(void)
 {
 	__u64 tsc_now = uk_arch_x86_64_rdtsc();
 	__u64 tsc_delta = tsc_now - tsc_start;
-	
+
 	if (tsc_freq == 0)
 		return 0;
-	
-	/* Convert TSC ticks to nanoseconds */
-	return (tsc_delta * 1000000000ULL) / tsc_freq;
+
+	/* Split to avoid overflow (uint64 * 10^9 overflows after ~7s at 2.5 GHz) */
+	__u64 secs = tsc_delta / tsc_freq;
+	__u64 rem  = tsc_delta % tsc_freq;
+	return secs * 1000000000ULL + (rem * 1000000000ULL) / tsc_freq;
 }
 
 /* Wall time in ns since the Unix epoch.
@@ -61,7 +63,7 @@ static int timer_handler(void *arg __unused)
  */
 static void estimate_tsc_freq(void)
 {
-	/* Assume a reasonable default frequency of 2.5 GHz 
+	/* Assume a reasonable default frequency of 2.5 GHz
 	 * This can be improved if Hyperlight passes the TSC frequency
 	 * to the guest in the PEB.
 	 */
