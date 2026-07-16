@@ -36,6 +36,7 @@
 static __u64 cow_scratch_base_gpa;
 static __u64 cow_scratch_base_gva;
 static __u64 cow_scratch_size;
+static __u64 cow_alloc_initial;
 static int   cow_initialized;
 
 extern int mmap_region_is_accessible(__u64 addr);
@@ -232,9 +233,12 @@ int cow_demand_map_page_ex(__u64 gva, int zero_data)
 		volatile __u64 *ap = (volatile __u64 *)ALLOCATOR_GVA;
 		__u64 alloc_end = *ap + 4 * HL_PAGE_SIZE;
 		if (alloc_end > cow_scratch_base_gpa + cow_scratch_size) {
-			uk_pr_crit("DEMAND_MAP: SCRATCH EXHAUSTED gva=0x%llx alloc=0x%llx end=0x%llx\n",
-				   gva, alloc_end,
-				   cow_scratch_base_gpa + cow_scratch_size);
+			__u64 used = *ap - cow_scratch_base_gpa;
+			uk_pr_crit("DEMAND_MAP: SCRATCH EXHAUSTED gva=0x%llx "
+				   "used=%lluMiB/%lluMiB base=0x%llx\n",
+				   gva, used >> 20,
+				   cow_scratch_size >> 20,
+				   cow_scratch_base_gpa);
 			return 0;
 		}
 	}
@@ -645,5 +649,11 @@ void hyperlight_cow_init(void)
 	cow_scratch_base_gpa = HL_MAX_GPA - scratch_size + 1;
 	cow_scratch_base_gva = HL_MAX_GVA - scratch_size + 1;
 	cow_scratch_size = scratch_size;
+	cow_alloc_initial = *(volatile __u64 *)ALLOCATOR_GVA;
 	cow_initialized = 1;
+	uk_pr_crit("COW: scratch base=0x%llx size=%lluMiB "
+		   "alloc_start=0x%llx free=%lluMiB\n",
+		   cow_scratch_base_gpa, scratch_size >> 20,
+		   cow_alloc_initial,
+		   (cow_scratch_base_gpa + scratch_size - cow_alloc_initial) >> 20);
 }
