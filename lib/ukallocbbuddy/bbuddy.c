@@ -54,6 +54,25 @@
 #include <uk/assert.h>
 #include <uk/list.h>
 #include <uk/paging.h>
+#include <uk/config.h>
+
+#if CONFIG_PLAT_HYPERLIGHT
+static volatile int _bbuddy_lock;
+
+static inline void bbuddy_lock(void)
+{
+	while (__sync_lock_test_and_set(&_bbuddy_lock, 1))
+		__asm__ volatile("pause" ::: "memory");
+}
+
+static inline void bbuddy_unlock(void)
+{
+	__sync_lock_release(&_bbuddy_lock);
+}
+#else
+#define bbuddy_lock()   do {} while (0)
+#define bbuddy_unlock() do {} while (0)
+#endif
 
 struct chunk_head {
 	struct uk_hlist_node link;
@@ -364,34 +383,33 @@ static void *bbuddy_palloc(struct uk_alloc *a, unsigned long num_pages)
 
 	UK_ASSERT(a);
 	UK_ASSERT(num_pages);
+
+	bbuddy_lock();
 	freelist_sanitycheck(b->free_head);
 
 	ord = num_pages_to_order(num_pages);
-	/* Find the smallest order of free memory that satisfies the request */
 	while (ord < FREELIST_SIZE && FREELIST_EMPTY(&b->free_head[ord]))
 		ord++;
-	/* We use >= as ord may have been set arbitrarily high by num_pages */
 	if (ord >= FREELIST_SIZE)
 		goto err_nomem;
 
-	/* Grab & unlink a chunk */
 	alloc_ch = uk_hlist_entry(b->free_head[ord].first, struct chunk_head,
 				  link);
 	uk_hlist_del(&alloc_ch->link);
 	UK_ASSERT(FREELIST_ALIGNED(alloc_ch, ord));
 
-	/* Trim off any extra pages off the end */
 	bbuddy_trim(b, alloc_ch, ord, num_pages);
 
-	/* Mark as in use and return */
 	map_alloc(b, (uintptr_t)alloc_ch, num_pages);
 
 	uk_alloc_stats_count_palloc(a, (void *) alloc_ch, num_pages);
 	freelist_sanitycheck(b->free_head);
+	bbuddy_unlock();
 
 	return (void *)alloc_ch;
 
 err_nomem:
+	bbuddy_unlock();
 	uk_pr_warn("%p: Cannot handle palloc request of %lu: Out of memory\n",
 		   a, num_pages);
 
@@ -473,14 +491,10 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
 	UK_ASSERT(num_pages);
 	UK_ASSERT(IS_ALIGNED((uintptr_t)obj, __PAGE_SIZE));
 
+	bbuddy_lock();
 	uk_alloc_stats_count_pfree(a, obj, num_pages);
 	freelist_sanitycheck(b->free_head);
 
-	/* Since obj can span an arbitrary page range, we may need to return it
-	 * in multiple page-order-sized chunks. At each iteration we pick the
-	 * largest chunk size permitted by alignment, attempt to merge it with
-	 * any free buddies, then link it into the appropriate freelist.
-	 */
 	do {
 		ord = ptr_order(base, npages_order(num_pages));
 		freed_pages = BBUDDY_PAGES(ord);
@@ -491,11 +505,8 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
 
 		ord = bbuddy_merge(b, &ch, ord);
 
-		/* Populate chunk (must be done before marking free) */
 		ch->page_order = ord;
-		/* Mark pages as free (must be done before linking in) */
 		map_free(b, (uintptr_t)base, freed_pages);
-		/* Link into freelist */
 		uk_hlist_add_head(&ch->link, &b->free_head[ord]);
 
 		num_pages -= freed_pages;
@@ -503,6 +514,7 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
 	} while (num_pages);
 
 	freelist_sanitycheck(b->free_head);
+	bbuddy_unlock();
 }
 
 static long bbuddy_pmaxalloc(struct uk_alloc *a)

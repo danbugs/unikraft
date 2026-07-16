@@ -96,6 +96,24 @@ struct mmap_addr {
 static struct mmap_addr *mmap_addr;
 
 #if CONFIG_PLAT_HYPERLIGHT
+static volatile int _mmap_lock;
+
+static inline void mmap_lock(void)
+{
+	while (__sync_lock_test_and_set(&_mmap_lock, 1))
+		__asm__ volatile("pause" ::: "memory");
+}
+
+static inline void mmap_unlock(void)
+{
+	__sync_lock_release(&_mmap_lock);
+}
+#else
+#define mmap_lock()   do {} while (0)
+#define mmap_unlock() do {} while (0)
+#endif
+
+#if CONFIG_PLAT_HYPERLIGHT
 int mmap_region_is_accessible(__u64 addr)
 {
 	struct mmap_addr *tmp = mmap_addr;
@@ -130,7 +148,7 @@ int mmap_region_is_accessible(__u64 addr)
 UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 		int, flags, int, fildes, off_t, off)
 {
-	struct mmap_addr *tmp = mmap_addr, *last = NULL, *new = NULL;
+	struct mmap_addr *tmp, *last = NULL, *new = NULL;
 
 	if (!len) {
 		errno = EINVAL;
@@ -138,17 +156,9 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 	}
 
 #if CONFIG_PLAT_HYPERLIGHT
-	/* On Hyperlight, accept file-backed mappings (fildes != -1) for the
-	 * dynamic linker to load shared libraries.  Accept both MAP_PRIVATE
-	 * and MAP_SHARED — in a unikernel there is only one address space,
-	 * so SHARED semantics are identical to PRIVATE.
-	 */
 	if (!(flags & (MAP_PRIVATE | MAP_SHARED)))
 		return MAP_FAILED;
 #else
-	/* Check if parameters match the ones that go use
-	 * Otherwise return 0 (unimplemented mmap)
-	 */
 	if (fildes != -1 || off)
 		return MAP_FAILED;
 	if (!(prot & (PROT_READ|PROT_WRITE)) && (prot != 0))
@@ -158,6 +168,9 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 			!(flags & (MAP_NORESERVE|MAP_ANON|MAP_PRIVATE)))
 		return MAP_FAILED;
 #endif
+
+	mmap_lock();
+	tmp = mmap_addr;
 
 	while (tmp) {
 		if (addr) {
@@ -194,6 +207,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 					}
 				}
 #endif
+				mmap_unlock();
 				return addr;
 			}
 		}
@@ -206,6 +220,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 	 * Return MAP_FAILED so callers can fall back to a hint-based allocation.
 	 */
 	if ((flags & MAP_FIXED) && addr) {
+		mmap_unlock();
 		errno = ENOMEM;
 		return MAP_FAILED;
 	}
@@ -233,6 +248,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 				sizeof(struct mmap_addr));
 		if (!new) {
 			mmap_virt_next -= aligned_len;
+			mmap_unlock();
 			errno = ENOMEM;
 			return MAP_FAILED;
 		}
@@ -258,6 +274,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 						       1)) {
 					mmap_virt_next -= aligned_len;
 					uk_free(uk_alloc_get_default(), new);
+					mmap_unlock();
 					errno = ENOMEM;
 					return MAP_FAILED;
 				}
@@ -346,6 +363,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 			mmap_timing_pread_ns += (_t3 - _t2);
 		}
 
+		mmap_unlock();
 		return mem;
 	}
 #else /* !CONFIG_PLAT_HYPERLIGHT */
@@ -395,7 +413,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 
 UK_SYSCALL_DEFINE(int, munmap, void*, addr, size_t, len)
 {
-	struct mmap_addr *tmp = mmap_addr, *prev = NULL;
+	struct mmap_addr *tmp, *prev = NULL;
 
 	if (!len) {
 		errno = EINVAL;
@@ -405,16 +423,16 @@ UK_SYSCALL_DEFINE(int, munmap, void*, addr, size_t, len)
 	if (!addr)
 		return 0;
 
+	mmap_lock();
+	tmp = mmap_addr;
+
 	while (tmp) {
 		if (addr >= tmp->begin && addr < tmp->end) {
-			/* We cannot release only some part of the allocation.
-			 * In that case, pretend we have done it and hope
-			 * everything will be fine
-			 */
-			if (len != (__uptr)tmp->end - (__uptr)tmp->begin)
+			if (len != (__uptr)tmp->end - (__uptr)tmp->begin) {
+				mmap_unlock();
 				return 0;
+			}
 
-			/* Caller wants to unmap the whole region. Easy! */
 			if (!prev)
 				mmap_addr = tmp->next;
 			else
@@ -424,7 +442,7 @@ UK_SYSCALL_DEFINE(int, munmap, void*, addr, size_t, len)
 			uk_free(uk_alloc_get_default(), tmp);
 			if (np > 0)
 				uk_pfree(uk_alloc_get_default(), addr, np);
-			/* np == 0: virtual-only region, no buddy pages to free */
+			mmap_unlock();
 			return 0;
 		}
 
@@ -432,7 +450,7 @@ UK_SYSCALL_DEFINE(int, munmap, void*, addr, size_t, len)
 		tmp = tmp->next;
 	}
 
-	/* No matching region found. But it is ok anyway */
+	mmap_unlock();
 	return 0;
 }
 
@@ -501,17 +519,13 @@ UK_SYSCALL_R_DEFINE(int, madvise, void*, addr, size_t, length, int, advice)
 UK_SYSCALL_R_DEFINE(int, mprotect, void*, addr, size_t, len, int, prot)
 {
 #if CONFIG_PLAT_HYPERLIGHT
-	/* When transitioning from PROT_NONE to readable/writable, back the
-	 * virtual pages with scratch memory.  This is needed because V8
-	 * uses mmap(PROT_NONE) + mprotect(PROT_READ|PROT_WRITE) to commit
-	 * memory regions.
-	 */
 	if (prot != PROT_NONE) {
 		size_t pg_off;
 		size_t aligned_len = (len + __PAGE_SIZE - 1) & ~(__PAGE_SIZE - 1);
 		__u64 base = (__u64)addr & ~(__PAGE_SIZE - 1);
 		for (pg_off = 0; pg_off < aligned_len; pg_off += __PAGE_SIZE)
 			cow_demand_map_page(base + pg_off);
+		mmap_lock();
 		struct mmap_addr *tmp = mmap_addr;
 		while (tmp) {
 			if ((void *)addr >= tmp->begin &&
@@ -521,6 +535,7 @@ UK_SYSCALL_R_DEFINE(int, mprotect, void*, addr, size_t, len, int, prot)
 			}
 			tmp = tmp->next;
 		}
+		mmap_unlock();
 	}
 #endif
 	return 0;
