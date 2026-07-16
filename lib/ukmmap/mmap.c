@@ -519,24 +519,53 @@ UK_SYSCALL_R_DEFINE(int, madvise, void*, addr, size_t, length, int, advice)
 UK_SYSCALL_R_DEFINE(int, mprotect, void*, addr, size_t, len, int, prot)
 {
 #if CONFIG_PLAT_HYPERLIGHT
+	size_t aligned_len = (len + __PAGE_SIZE - 1) & ~(__PAGE_SIZE - 1);
+	__u64 base = (__u64)addr & ~(__PAGE_SIZE - 1);
+
 	if (prot != PROT_NONE) {
 		size_t pg_off;
-		size_t aligned_len = (len + __PAGE_SIZE - 1) & ~(__PAGE_SIZE - 1);
-		__u64 base = (__u64)addr & ~(__PAGE_SIZE - 1);
 		for (pg_off = 0; pg_off < aligned_len; pg_off += __PAGE_SIZE)
 			cow_demand_map_page(base + pg_off);
-		mmap_lock();
-		struct mmap_addr *tmp = mmap_addr;
-		while (tmp) {
-			if ((void *)addr >= tmp->begin &&
-			    (void *)addr < tmp->end) {
+	}
+
+	/* Create a sub-region entry so mmap_region_is_accessible tracks
+	 * the actual protection.  Prepending means the most recent entry
+	 * for any address wins during lookup.
+	 */
+	mmap_lock();
+	struct mmap_addr *tmp = mmap_addr;
+	int found = 0;
+	while (tmp) {
+		if ((void *)addr >= tmp->begin &&
+		    (void *)addr < tmp->end) {
+			found = 1;
+			/* If the entry covers exactly this range, just
+			 * update its prot in place.
+			 */
+			if (tmp->begin == (void *)base &&
+			    tmp->end == (void *)(base + aligned_len)) {
 				tmp->prot = prot;
 				break;
 			}
-			tmp = tmp->next;
+			/* Otherwise create a sub-region entry so the
+			 * parent's prot stays untouched.
+			 */
+			struct mmap_addr *sub = uk_malloc(
+				uk_alloc_get_default(),
+				sizeof(struct mmap_addr));
+			if (sub) {
+				sub->begin = (void *)base;
+				sub->end = (void *)(base + aligned_len);
+				sub->num_pages = 0;
+				sub->prot = prot;
+				sub->next = mmap_addr;
+				mmap_addr = sub;
+			}
+			break;
 		}
-		mmap_unlock();
+		tmp = tmp->next;
 	}
+	mmap_unlock();
 #endif
 	return 0;
 }
