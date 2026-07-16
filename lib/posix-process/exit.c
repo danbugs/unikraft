@@ -171,11 +171,7 @@ void pprocess_exit(struct posix_process *pprocess,
 	parent_process = pprocess->parent;
 
 #if CONFIG_LIBPOSIX_PROCESS_SIGNAL
-#if CONFIG_PLAT_HYPERLIGHT
-	if (parent_process && pprocess->pid <= 2) {
-#else
 	if (parent_process) {
-#endif
 		ret = signal_exit(parent_process);
 		if (ret > 0) {
 			uk_pr_info("Parent ignores SIGHLD, terminating\n");
@@ -250,14 +246,12 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 	UK_ASSERT(this_pthread);
 	UK_ASSERT(this_pthread->process);
 
-#if CONFIG_PLAT_HYPERLIGHT
-	if (this_pthread->process->pid <= 2) {
-		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-	}
-#endif
-
 	/* Last thread, exit the process */
 	if (uk_list_is_singular(&this_pthread->process->threads)) {
+#if CONFIG_PLAT_HYPERLIGHT
+		if (this_pthread->process->pid <= 2)
+			uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
+#endif
 		pprocess_exit(this_pthread->process, POSIX_PROCESS_EXITED,
 			      status);
 		uk_sched_thread_exit();
@@ -275,9 +269,8 @@ UK_LLSYSCALL_R_DEFINE(int, exit_group, int, status)
 	UK_ASSERT(pprocess);
 
 #if CONFIG_PLAT_HYPERLIGHT
-	if (pprocess->pid <= 2) {
+	if (pprocess->pid <= 2)
 		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-	}
 #endif
 
 	pprocess_exit(pprocess, POSIX_PROCESS_EXITED, status);
