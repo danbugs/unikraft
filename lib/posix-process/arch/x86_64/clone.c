@@ -8,6 +8,22 @@
 #include <uk/process.h>
 #include <uk/arch/ctx.h>
 #include <uk/lcpu.h>
+#include <uk/print.h>
+
+static void child_execenv_load_traced(long auxsp_pos)
+{
+	struct ukarch_execenv *cexecenv = (struct ukarch_execenv *)auxsp_pos;
+
+	uk_pr_err("VFORK_DIAG: child scheduled! execenv=%p "
+		  "RIP=0x%lx RSP=0x%lx RAX=0x%lx R9=0x%lx\n",
+		  cexecenv,
+		  uk_lcpu_regs_get(cexecenv->regs, RIP),
+		  uk_lcpu_regs_get(cexecenv->regs, RSP),
+		  uk_lcpu_regs_get(cexecenv->regs, RAX),
+		  uk_lcpu_regs_get(cexecenv->regs, R9));
+
+	ukarch_execenv_load(auxsp_pos);
+}
 
 void clone_setup_child_ctx(struct ukarch_execenv *pexecenv,
 			   struct uk_thread *child, __uptr sp,
@@ -68,6 +84,6 @@ void clone_setup_child_ctx(struct ukarch_execenv *pexecenv,
 	ukarch_ctx_init_entry1(&child->ctx,
 			       auxsp_pos,
 			       1,
-			       (ukarch_ctx_entry1)&ukarch_execenv_load,
+			       (ukarch_ctx_entry1)&child_execenv_load_traced,
 			       auxsp_pos);
 }

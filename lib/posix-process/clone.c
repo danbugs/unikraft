@@ -216,15 +216,8 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 #endif /* !CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS */
 
 	if (unlikely(!(flags & CLONE_VM))) {
-		/* Unikraft is a single-address-space OS: fork-style clones
-		 * (without CLONE_VM) are promoted to vfork semantics
-		 * (CLONE_VM | CLONE_VFORK) since we cannot duplicate the
-		 * address space. The parent blocks until the child calls
-		 * execve() or _exit().
-		 */
-		uk_pr_debug("No CLONE_VM: promoting to vfork semantics\n");
 		flags |= CLONE_VM | CLONE_VFORK;
-		cl_args->flags |= CLONE_VM | CLONE_VFORK;
+		cl_args->flags = flags;
 	}
 	if (unlikely(flags & CLONE_CHILD_SETTID && !cl_args->child_tid))
 		return -EINVAL;
@@ -425,6 +418,7 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 	}
 	child_tid = ukthread2tid(child);
 	child_pid = ukthread2pid(child);
+
 	/* Raise clone event */
 	clone_event = (struct posix_process_clone_event_data) {
 		.cl_args = cl_args,
@@ -551,27 +545,18 @@ int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
 		pthread_self = saved_pthread_self_val;
 		parent_pt->state = POSIX_THREAD_RUNNING;
 
-		/* Flush stale signals queued by the child's exit
-		 * (e.g. SIGCHLD from signal_exit).  The signal
-		 * descriptor was NOT saved/restored — only the
-		 * pprocess pointer to it — so its queue may hold
-		 * entries the restored pprocess doesn't expect.
-		 */
-#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
-		if (parent_pt->process && parent_pt->process->signal) {
-			struct uk_signal_pdesc *pd =
-				parent_pt->process->signal;
-			uk_sigemptyset(&pd->sigqueue.pending);
-			for (int _i = 0; _i < SIG_ARRAY_COUNT; _i++)
-				UK_INIT_LIST_HEAD(
-					&pd->sigqueue.list_head[_i]);
-			pd->queued_count = 0;
-		}
-#endif
+		/* SIGCHLD from child's exit is valid — keep it */
 #endif
 		memcpy((void *)parent_rsp, stack_save, vfork_save_sz);
 		uk_free(s->a, stack_save);
 
+		uk_pr_crit("VFORK_DIAG: parent resumed, "
+			   "execenv_rip=0x%lx execenv_rsp=0x%lx "
+			   "execenv_rcx=0x%lx execenv_rax=0x%lx\n",
+			   uk_lcpu_regs_get(execenv->regs, RIP),
+			   uk_lcpu_regs_get(execenv->regs, RSP),
+			   uk_lcpu_regs_get(execenv->regs, RCX),
+			   uk_lcpu_regs_get(execenv->regs, RAX));
 		goto out;
 	}
 
