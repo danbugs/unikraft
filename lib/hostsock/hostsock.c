@@ -205,6 +205,13 @@ static int json_errno(const char *json)
 		return -EINVAL;
 	if (strstr(p, "bad_fd"))
 		return -EBADF;
+	if (strstr(p, "roken pipe") || strstr(p, "BrokenPipe"))
+		return -EPIPE;
+	if (strstr(p, "unreachable") || strstr(p, "NetworkUnreachable"))
+		return -ENETUNREACH;
+	if (strstr(p, "HostUnreachable") || strstr(p, "No route"))
+		return -EHOSTUNREACH;
+	uk_pr_crit("hostsock: unmapped error: %s\n", p);
 	return -EIO;
 }
 
