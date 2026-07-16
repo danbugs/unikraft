@@ -622,10 +622,15 @@ static int hyperlight_cow_pf_handler(void *data)
 			   (unsigned long)fault_addr);
 	}
 
-	uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx rsp=0x%lx\n",
-		   (unsigned long)fault_addr, error_code,
-		   uk_lcpu_regs_get(regs, RIP),
-		   uk_lcpu_regs_get(regs, RSP));
+	{
+		volatile __u64 *ap = (volatile __u64 *)ALLOCATOR_GVA;
+		uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx "
+			   "rsp=0x%lx scratch_used=%lluMiB\n",
+			   (unsigned long)fault_addr, error_code,
+			   uk_lcpu_regs_get(regs, RIP),
+			   uk_lcpu_regs_get(regs, RSP),
+			   (*ap - cow_scratch_base_gpa) >> 20);
+	}
 	return UK_EVENT_NOT_HANDLED;
 }
 
