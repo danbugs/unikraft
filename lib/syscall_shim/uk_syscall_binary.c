@@ -42,6 +42,7 @@
 #include <uk/essentials.h>
 #include <uk/prio.h>
 #include <uk/thread.h>
+#include <uk/sched.h>
 #if CONFIG_LIBSYSCALL_SHIM_STRACE
 #include <uk/print.h>
 #endif /* CONFIG_LIBSYSCALL_SHIM_STRACE */
@@ -111,6 +112,15 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 				 UK_SYSCALL_EXIT_CTX_BINARY_SYSCALL);
 	uk_syscall_exittab_run(&exit_ctx);
 	uk_syscall_nested_depth--;
+
+	/* Yield periodically to prevent cooperative scheduling starvation
+	 * when a process makes sustained syscalls (e.g. V8 init). */
+	{
+		static unsigned int syscall_count;
+
+		if (++syscall_count % 64 == 0)
+			uk_sched_yield();
+	}
 
 #if CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS
 	t->tlsp = uk_lcpu_sysctx_get(execenv->sysctx, TLSP);
