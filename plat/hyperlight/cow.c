@@ -627,6 +627,14 @@ static int hyperlight_cow_pf_handler(void *data)
 			   (unsigned long)fault_addr, error_code,
 			   uk_lcpu_regs_get(regs, RIP),
 			   uk_sys_getpid());
+		uk_pr_crit("PF regs: r13=0x%lx r14=0x%lx r15=0x%lx "
+			   "rbx=0x%lx rcx=0x%lx rdx=0x%lx\n",
+			   uk_lcpu_regs_get(regs, R13),
+			   uk_lcpu_regs_get(regs, R14),
+			   uk_lcpu_regs_get(regs, R15),
+			   uk_lcpu_regs_get(regs, RBX),
+			   uk_lcpu_regs_get(regs, RCX),
+			   uk_lcpu_regs_get(regs, RDX));
 	}
 	return UK_EVENT_NOT_HANDLED;
 }

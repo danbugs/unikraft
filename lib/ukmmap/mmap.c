@@ -119,10 +119,18 @@ int mmap_region_is_accessible(__u64 addr)
 	struct mmap_addr *tmp = mmap_addr;
 
 	while (tmp) {
-		if ((__u64)tmp->begin <= addr && addr < (__u64)tmp->end)
+		if ((__u64)tmp->begin <= addr && addr < (__u64)tmp->end) {
+			if (tmp->prot == PROT_NONE && addr >= 0x1000000000ULL)
+				uk_pr_crit("ACCESSIBLE: 0x%lx in [0x%lx,0x%lx) PROT_NONE\n",
+					   (unsigned long)addr,
+					   (__u64)tmp->begin, (__u64)tmp->end);
 			return tmp->prot != PROT_NONE;
+		}
 		tmp = tmp->next;
 	}
+	if (addr >= 0x1000000000ULL)
+		uk_pr_crit("ACCESSIBLE: 0x%lx NOT IN ANY REGION\n",
+			   (unsigned long)addr);
 	return 0;
 }
 #endif
@@ -263,6 +271,10 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 			mmap_addr = new;
 		else
 			last->next = new;
+		if (prot == PROT_NONE && aligned_len >= 0x40000000ULL)
+			uk_pr_crit("MMAP RESERVE: [0x%lx,0x%lx) len=0x%lx\n",
+				   (__u64)mem, (__u64)(mem + aligned_len),
+				   (unsigned long)aligned_len);
 		__u64 _t1 = ukplat_monotonic_clock();
 		mmap_timing_bookkeep_ns += (_t1 - _t0);
 		mmap_timing_calls++;
