@@ -43,6 +43,7 @@
 #include <uk/prio.h>
 #include <uk/thread.h>
 #include <uk/sched.h>
+#include <uk/lcpu/except.h>
 #if CONFIG_LIBSYSCALL_SHIM_STRACE
 #include <uk/print.h>
 #endif /* CONFIG_LIBSYSCALL_SHIM_STRACE */
@@ -120,8 +121,10 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 	{
 		static unsigned int syscall_count;
 
-		if (++syscall_count % 64 == 0)
+		if (++syscall_count % 64 == 0) {
+			uk_lcpu_irqs_handle_pending();
 			uk_sched_yield();
+		}
 	}
 }
 
