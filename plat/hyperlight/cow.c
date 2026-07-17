@@ -627,14 +627,38 @@ static int hyperlight_cow_pf_handler(void *data)
 			   (unsigned long)fault_addr, error_code,
 			   uk_lcpu_regs_get(regs, RIP),
 			   uk_sys_getpid());
-		uk_pr_crit("PF regs: r13=0x%lx r14=0x%lx r15=0x%lx "
-			   "rbx=0x%lx rcx=0x%lx rdx=0x%lx\n",
+		uk_pr_crit("PF regs: rax=0x%lx rbx=0x%lx rcx=0x%lx "
+			   "rdx=0x%lx rdi=0x%lx rsi=0x%lx\n",
+			   uk_lcpu_regs_get(regs, RAX),
+			   uk_lcpu_regs_get(regs, RBX),
+			   uk_lcpu_regs_get(regs, RCX),
+			   uk_lcpu_regs_get(regs, RDX),
+			   uk_lcpu_regs_get(regs, RDI),
+			   uk_lcpu_regs_get(regs, RSI));
+		uk_pr_crit("PF regs: r8=0x%lx r9=0x%lx r10=0x%lx "
+			   "r11=0x%lx r12=0x%lx r13=0x%lx "
+			   "r14=0x%lx r15=0x%lx rbp=0x%lx\n",
+			   uk_lcpu_regs_get(regs, R8),
+			   uk_lcpu_regs_get(regs, R9),
+			   uk_lcpu_regs_get(regs, R10),
+			   uk_lcpu_regs_get(regs, R11),
+			   uk_lcpu_regs_get(regs, R12),
 			   uk_lcpu_regs_get(regs, R13),
 			   uk_lcpu_regs_get(regs, R14),
 			   uk_lcpu_regs_get(regs, R15),
-			   uk_lcpu_regs_get(regs, RBX),
-			   uk_lcpu_regs_get(regs, RCX),
-			   uk_lcpu_regs_get(regs, RDX));
+			   uk_lcpu_regs_get(regs, RBP));
+		{
+			unsigned char *ip = (unsigned char *)
+				uk_lcpu_regs_get(regs, RIP);
+			uk_pr_crit("PF insn @0x%lx: %02x %02x %02x %02x "
+				   "%02x %02x %02x %02x %02x %02x "
+				   "%02x %02x %02x %02x %02x %02x\n",
+				   (unsigned long)ip,
+				   ip[0], ip[1], ip[2], ip[3],
+				   ip[4], ip[5], ip[6], ip[7],
+				   ip[8], ip[9], ip[10], ip[11],
+				   ip[12], ip[13], ip[14], ip[15]);
+		}
 	}
 	return UK_EVENT_NOT_HANDLED;
 }
