@@ -44,6 +44,7 @@
 #include <uk/thread.h>
 #include <uk/sched.h>
 #include <uk/lcpu/except.h>
+#include <uk/plat/time.h>
 #if CONFIG_LIBSYSCALL_SHIM_STRACE
 #include <uk/print.h>
 #endif /* CONFIG_LIBSYSCALL_SHIM_STRACE */
@@ -119,9 +120,11 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 #endif /* CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS */
 
 	{
-		static unsigned int syscall_count;
+		static __nsec last_yield_ns;
+		__nsec now = ukplat_monotonic_clock();
 
-		if (++syscall_count % 64 == 0) {
+		if (now - last_yield_ns > 1000000) {
+			last_yield_ns = now;
 			uk_lcpu_irqs_handle_pending();
 			uk_sched_yield();
 		}
