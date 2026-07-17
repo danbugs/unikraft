@@ -659,6 +659,21 @@ static int hyperlight_cow_pf_handler(void *data)
 				   ip[8], ip[9], ip[10], ip[11],
 				   ip[12], ip[13], ip[14], ip[15]);
 		}
+		{
+			__u64 rsp = uk_lcpu_regs_get(regs, RSP);
+			__u64 *stk = (__u64 *)rsp;
+			uk_pr_crit("PF rsp=0x%lx\n",
+				   (unsigned long)rsp);
+			uk_pr_crit("PF stack: [rsp]=0x%lx [rsp+8]=0x%lx "
+				   "[rsp+16]=0x%lx [rsp+24]=0x%lx "
+				   "[rsp+32]=0x%lx [rsp+40]=0x%lx\n",
+				   (unsigned long)stk[0],
+				   (unsigned long)stk[1],
+				   (unsigned long)stk[2],
+				   (unsigned long)stk[3],
+				   (unsigned long)stk[4],
+				   (unsigned long)stk[5]);
+		}
 	}
 	return UK_EVENT_NOT_HANDLED;
 }
