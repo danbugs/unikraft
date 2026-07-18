@@ -49,15 +49,6 @@ static void uk_sigact_term(int __unused sig)
 	pprocess = uk_pprocess_current();
 	UK_ASSERT(pprocess);
 
-#ifdef CONFIG_HYPERLIGHT_HCALL
-	{
-		extern int _hostsock_listener_pid;
-		if (_hostsock_listener_pid > 0 &&
-		    pprocess->pid == _hostsock_listener_pid)
-			return;
-	}
-#endif
-
 	uk_pr_info("pid: %d terminated by signal\n", pprocess->pid);
 
 	pprocess_exit(pprocess, POSIX_PROCESS_KILLED, sig);
@@ -504,8 +495,11 @@ void sys_error_handler(struct ukarch_execenv *ee __unused, long arg)
 		goto err_panic;
 	}
 
-	if (KERN_SIGACTION(pproc, error->signum)->ks_handler == SIG_DFL)
+	if (KERN_SIGACTION(pproc, error->signum)->ks_handler == SIG_DFL) {
+		uk_pr_crit("SIG_DELIVER: handler=SIG_DFL sig=%d vaddr=0x%lx\n",
+			   error->signum, (unsigned long)error->vaddr);
 		goto err_panic;
+	}
 
 	/* Prepare siginfo — use hardware-fault codes so signal handlers
 	 * (e.g. V8's SIGSEGV handler) can distinguish faults from kill().

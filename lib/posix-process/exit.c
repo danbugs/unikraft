@@ -214,7 +214,7 @@ void pprocess_exit(struct posix_process *pprocess,
 	/* Unblock wait */
 	if (parent_process && !nowait) {
 		uk_pprocess_foreach_pthread(parent_process, pt, ptn) {
-			if (PTHREAD_WAITING_FOR_PID(pt, pprocess->pid) ||
+			if (PTHREAD_WAITING_FOR_PID(pt, uk_sys_getpid()) ||
 			    PTHREAD_BLOCKING_ON_SIGNAL(pt)) {
 				uk_semaphore_up(&parent_process->wait_semaphore);
 				break;
@@ -246,21 +246,10 @@ UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
 	UK_ASSERT(this_pthread);
 	UK_ASSERT(this_pthread->process);
 
-#if CONFIG_PLAT_HYPERLIGHT
-	{
-		extern int _hostsock_listener_pid;
-		if (_hostsock_listener_pid > 0 &&
-		    this_pthread->process->pid == _hostsock_listener_pid) {
-			for (;;)
-				uk_sched_yield();
-		}
-	}
-#endif
-
 	/* Last thread, exit the process */
 	if (uk_list_is_singular(&this_pthread->process->threads)) {
 #if CONFIG_PLAT_HYPERLIGHT
-		if (this_pthread->process->pid == 1)
+		if (this_pthread->process->pid <= 2)
 			uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
 #endif
 		pprocess_exit(this_pthread->process, POSIX_PROCESS_EXITED,
@@ -280,16 +269,8 @@ UK_LLSYSCALL_R_DEFINE(int, exit_group, int, status)
 	UK_ASSERT(pprocess);
 
 #if CONFIG_PLAT_HYPERLIGHT
-	if (pprocess->pid == 1)
+	if (pprocess->pid <= 2)
 		uk_pm_shutdown(UK_PM_SHUTDOWN_OP_SYSHALT);
-	{
-		extern int _hostsock_listener_pid;
-		if (_hostsock_listener_pid > 0 &&
-		    pprocess->pid == _hostsock_listener_pid) {
-			for (;;)
-				uk_sched_yield();
-		}
-	}
 #endif
 
 	pprocess_exit(pprocess, POSIX_PROCESS_EXITED, status);

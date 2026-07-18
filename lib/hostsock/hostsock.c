@@ -40,10 +40,22 @@ struct hostsock_data {
 	int nonblock;
 };
 
-/* Static per-call buffers. Not thread-safe; callers serialise via
- * posix-socket and vfscore locking. */
+/* Static per-call buffers — protected by rpc_lock for CLONE_VM safety. */
 static char rpc_req[HOSTSOCK_RPC_MAX];
 static char rpc_resp[HOSTSOCK_RPC_MAX];
+
+static volatile int _rpc_lock;
+
+static inline void rpc_lock(void)
+{
+	while (__sync_lock_test_and_set(&_rpc_lock, 1))
+		__asm__ volatile("pause" ::: "memory");
+}
+
+static inline void rpc_unlock(void)
+{
+	__sync_lock_release(&_rpc_lock);
+}
 
 /* Static scatter/gather buffer for sendmsg/recvmsg multi-iovec
  * flattening.  Stack allocation (32 KB) is unsafe on 64 KB stacks. */
@@ -205,6 +217,13 @@ static int json_errno(const char *json)
 		return -EINVAL;
 	if (strstr(p, "bad_fd"))
 		return -EBADF;
+	if (strstr(p, "roken pipe") || strstr(p, "BrokenPipe"))
+		return -EPIPE;
+	if (strstr(p, "unreachable") || strstr(p, "NetworkUnreachable"))
+		return -ENETUNREACH;
+	if (strstr(p, "HostUnreachable") || strstr(p, "No route"))
+		return -EHOSTUNREACH;
+	uk_pr_crit("hostsock: unmapped error: %s\n", p);
 	return -EIO;
 }
 
@@ -244,10 +263,12 @@ static int json_get_string(const char *json, const char *key,
 static int rpc_exchange(size_t req_len, size_t *resp_len)
 {
 	__sz rlen = 0;
+	rpc_lock();
 	int rc = hyperlight_hcall((const __u8 *)rpc_req, req_len,
 				  (__u8 *)rpc_resp,
 				  sizeof(rpc_resp) - 1, &rlen);
 	if (rc < 0) {
+		rpc_unlock();
 		uk_pr_err("hostsock: hcall failed: %d\n", rc);
 		return -EIO;
 	}
@@ -255,9 +276,11 @@ static int rpc_exchange(size_t req_len, size_t *resp_len)
 	if (resp_len) *resp_len = rlen;
 	if (json_has_error(rpc_resp)) {
 		int e = json_errno(rpc_resp);
+		rpc_unlock();
 		uk_pr_crit("hostsock: RPC error (%d): %s\n", e, rpc_resp);
 		return e;
 	}
+	rpc_unlock();
 	return 0;
 }
 
@@ -446,11 +469,6 @@ static void json_to_sockaddr(const char *json, struct sockaddr *addr,
 static posix_sock *tracked_socks[HOSTSOCK_MAX_TRACKED];
 static int tracked_count;
 
-static const void *_hostsock_vol_marker;
-static struct { uint32_t host_fd; unsigned events; }
-	_hostsock_ev_cache[HOSTSOCK_MAX_TRACKED];
-static int _hostsock_ev_cache_count;
-
 static void hostsock_track(posix_sock *sock)
 {
 	if (tracked_count < HOSTSOCK_MAX_TRACKED)
@@ -468,14 +486,6 @@ static void hostsock_untrack(posix_sock *sock)
 }
 
 int hostsock_rescan_events(void);
-
-struct uk_thread *_hostsock_listener_tid;
-int _hostsock_listener_pid;
-
-const void *hostsock_get_vol_marker(void)
-{
-	return _hostsock_vol_marker;
-}
 
 /* -------- socket operations -------- */
 
@@ -963,8 +973,6 @@ static int hostsock_socketpair(struct posix_socket_driver *d __attribute__((unus
 
 static void hostsock_poll_setup(posix_sock *sock)
 {
-	if (!_hostsock_vol_marker)
-		_hostsock_vol_marker = sock->vol;
 	uint32_t fd = get_host_fd(sock);
 	/* POLLIN=1, POLLOUT=4 — check real readiness via host poll(). */
 	int revents = hostsock_check_ready(fd, 1 | 4);
@@ -981,7 +989,6 @@ int hostsock_rescan_events(void)
 {
 	int woke = 0;
 
-	_hostsock_ev_cache_count = 0;
 	for (int i = 0; i < tracked_count; i++) {
 		posix_sock *sock = tracked_socks[i];
 		uint32_t fd = get_host_fd(sock);
@@ -991,34 +998,11 @@ int hostsock_rescan_events(void)
 			events |= UKFD_POLLIN;
 		if (revents & 4)
 			events |= UKFD_POLLOUT;
-		_hostsock_ev_cache[_hostsock_ev_cache_count].host_fd = fd;
-		_hostsock_ev_cache[_hostsock_ev_cache_count].events = events;
-		_hostsock_ev_cache_count++;
 		posix_sock_event_assign(sock, events);
 		if (events)
 			woke = 1;
 	}
 	return woke;
-}
-
-unsigned int hostsock_lookup_file_events(const struct uk_file *f)
-{
-	struct posix_socket_node *node;
-	struct hostsock_data *sd;
-	uint32_t host_fd;
-
-	if (!_hostsock_vol_marker || f->vol != _hostsock_vol_marker)
-		return 0;
-	node = (struct posix_socket_node *)f->node;
-	if (!node || !node->sock_data)
-		return 0;
-	sd = (struct hostsock_data *)node->sock_data;
-	host_fd = sd->host_fd;
-	for (int i = 0; i < _hostsock_ev_cache_count; i++) {
-		if (_hostsock_ev_cache[i].host_fd == host_fd)
-			return _hostsock_ev_cache[i].events;
-	}
-	return 0;
 }
 
 static struct posix_socket_ops hostsock_ops = {

@@ -66,10 +66,6 @@ static void __noreturn execve_ctx_switch(long arg0, long arg1)
 	}
 
 switch_ctx:
-	uk_pr_crit("EXECVE_DIAG: ctx_switch execenv=%p RIP=0x%lx RSP=0x%lx\n",
-		  execenv_new,
-		  uk_lcpu_regs_get(execenv_new->regs, RIP),
-		  uk_lcpu_regs_get(execenv_new->regs, RSP));
 	ukarch_execenv_load((long)execenv_new);
 }
 
@@ -109,21 +105,6 @@ UK_SYSCALL_R_E_DEFINE(int, execve, const char *, pathname,
 	 * and treat NULL pointers as valid.
 	 */
 	UK_ASSERT(pathname);
-
-	uk_pr_crit("EXECVE_DIAG: execve(\"%s\")\n", pathname);
-	if (argv) {
-		for (int _i = 0; argv[_i]; _i++)
-			uk_pr_crit("EXECVE_DIAG:   argv[%d]=\"%s\"\n", _i,
-				   argv[_i]);
-	}
-	if (envp) {
-		for (int _i = 0; envp[_i]; _i++) {
-			if (strstr(envp[_i], "VSCODE") ||
-			    strstr(envp[_i], "NODE_CHANNEL"))
-				uk_pr_crit("EXECVE_DIAG:   env: %s\n",
-					   envp[_i]);
-		}
-	}
 
 	this_thread = uk_thread_current();
 	UK_ASSERT(this_thread);
@@ -207,19 +188,9 @@ UK_SYSCALL_R_E_DEFINE(int, execve, const char *, pathname,
 	if (unlikely(rc))
 		goto err_free_stack_new;
 
-	uk_pr_crit("EXECVE_DIAG: binfmt done ip=0x%lx sp=0x%lx execenv=%p\n",
-		  (unsigned long)loader_args.ctx.ip,
-		  (unsigned long)loader_args.ctx.sp,
-		  execenv_new);
-
 	execve_arch_execenv_init(execenv_new, execenv,
 				 loader_args.ctx.ip,
 				 loader_args.ctx.sp);
-
-	uk_pr_crit("EXECVE_DIAG: execenv_init done, "
-		  "RIP=0x%lx RSP=0x%lx\n",
-		  uk_lcpu_regs_get(execenv_new->regs, RIP),
-		  uk_lcpu_regs_get(execenv_new->regs, RSP));
 
 	event_data = (struct posix_process_execve_event_data) {
 		.thread = this_thread,
