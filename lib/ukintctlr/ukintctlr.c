@@ -1,108 +1,287 @@
-/* SPDX-License-Identifier: BSD-3-Clause */
-/* Copyright (c) 2024, Unikraft GmbH and The Unikraft Authors.
- * Licensed under the BSD-3-Clause License (the "License").
- * You may not use this file except in compliance with the License.
+/* SPDX-License-Identifier: ISC */
+/*
+ * Authors: Dan Williams
+ *          Martin Lucina
+ *          Ricardo Koller
+ *          Costin Lupu <costin.lupu@cs.pub.ro>
+ *
+ * Copyright (c) 2015-2017 IBM
+ * Copyright (c) 2016-2017 Docker, Inc.
+ * Copyright (c) 2018, NEC Europe Ltd., NEC Corporation
+ *
+ * Permission to use, copy, modify, and/or distribute this software
+ * for any purpose with or without fee is hereby granted, provided
+ * that the above copyright notice and this permission notice appear
+ * in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
+ * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+ * OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+ * NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+/* Taken from solo5 intr.c */
 
+#include <stdlib.h>
+#include <uk/alloc.h>
+#include <uk/atomic.h>
+#include <uk/bitops/bitmap.h>
+#include <uk/lcpu.h>
+#include <uk/plat/time.h>
 #include <uk/intctlr.h>
+#include <uk/intctlr/limits.h>
 #include <uk/assert.h>
 #include <uk/event.h>
-#include <uk/lcpu.h>
-#include <uk/arch/util.h>
-#include <uk/asm/pic.h>
+#include <uk/trace.h>
+#include <uk/print.h>
+#include <errno.h>
+#include <uk/bitops.h>
 
-static struct uk_intctlr_desc intctlr;
+#if !defined(UK_INTCTLR_MAX_IRQ) ||					\
+	!defined(UK_INTCTLR_ALLOCABLE_IRQ_COUNT) ||			\
+	!defined(UK_INTCTLR_FIRST_ALLOCABLE_IRQ) ||			\
+	!defined(UK_INTCTLR_LAST_ALLOCABLE_IRQ)
+#error "Incomplete definition of uk_intctlr driver limits"
+#endif
 
-static int configure_irq(struct uk_intctlr_irq *irq __unused)
+#define MAX_IRQ				UK_INTCTLR_MAX_IRQ
+#define MAX_HANDLERS_PER_IRQ		CONFIG_LIBUKINTCTLR_MAX_HANDLERS_PER_IRQ
+
+#define ALLOCABLE_IRQ_COUNT		UK_INTCTLR_ALLOCABLE_IRQ_COUNT
+#define FIRST_ALLOCABLE_IRQ		UK_INTCTLR_FIRST_ALLOCABLE_IRQ
+#define LAST_ALLOCABLE_IRQ		UK_INTCTLR_LAST_ALLOCABLE_IRQ
+
+struct uk_intctlr_desc *uk_intctlr;
+
+UK_TRACEPOINT(trace_uk_intctlr_unhandled_irq, "Unhandled irq=%lu\n",
+	      unsigned long);
+
+static unsigned long irqs_allocated[UK_BITS_TO_LONGS(ALLOCABLE_IRQ_COUNT)];
+
+/* IRQ handlers declarations */
+struct irq_handler {
+	uk_intctlr_irq_handler_func_t func;
+	void *arg;
+};
+
+static struct irq_handler irq_handlers[MAX_IRQ][MAX_HANDLERS_PER_IRQ];
+
+static inline struct irq_handler *allocate_handler(unsigned long irq)
 {
+	UK_ASSERT(irq <= MAX_IRQ);
+
+	for (int i = 0; i < MAX_HANDLERS_PER_IRQ; i++)
+		if (irq_handlers[irq][i].func == NULL)
+			return &irq_handlers[irq][i];
+	return NULL;
+}
+
+int uk_intctlr_irq_register(unsigned int irq,
+			    uk_intctlr_irq_handler_func_t func, void *arg)
+{
+	struct irq_handler *h;
+	unsigned long flags;
+
+	UK_ASSERT(func);
+	UK_ASSERT(irq <= MAX_IRQ);
+
+	flags = uk_lcpu_save_irqf();
+	h = allocate_handler(irq);
+	if (!h) {
+		uk_lcpu_restore_irqf(flags);
+		return -ENOMEM;
+	}
+
+	h->func = func;
+	h->arg = arg;
+
+	uk_lcpu_restore_irqf(flags);
+
+	uk_intctlr->ops->unmask_irq(irq);
+
 	return 0;
 }
 
-static void hyperlight_mask_irq(unsigned int irq)
+int uk_intctlr_irq_unregister(unsigned int irq,
+			      uk_intctlr_irq_handler_func_t func)
 {
-	__u16 port = IRQ_PORT(irq);
+	struct irq_handler *h = NULL;
+	unsigned long flags;
+	int count;
+	int i;
 
-	uk_arch_x86_64_outb(port,
-			    uk_arch_x86_64_inb(port) | (1 << IRQ_OFFSET(irq)));
+	UK_ASSERT(func);
+	UK_ASSERT(irq <= MAX_IRQ);
+
+	flags = uk_lcpu_save_irqf();
+
+	count = MAX_HANDLERS_PER_IRQ;
+	for (i = 0; i < count; i++) {
+recheck:
+		if (irq_handlers[irq][i].func == func) {
+			h = &irq_handlers[irq][i];
+			h->func = NULL;
+			h->arg = NULL;
+
+			/* Copy all following handlers forward */
+			memmove(h, h + 1, sizeof(*h) * (count - i - 1));
+			goto recheck;
+		}
+	}
+
+	uk_lcpu_restore_irqf(flags);
+
+	/* If `h` is set, then there was at least one instance found */
+	if (unlikely(!h)) {
+		uk_pr_crit("Invalid irq handler %p for irq %u ", func, irq);
+		return -ENOENT;
+	}
+
+	return 0;
 }
 
-static void hyperlight_unmask_irq(unsigned int irq)
+/*
+ * TODO: This is a temporary solution used to identify non TSC clock
+ * interrupts in order to stop waiting for interrupts with deadline.
+ */
+extern unsigned long sched_have_pending_events;
+
+void uk_intctlr_irq_handle(struct uk_lcpu_except_irq_ctx *ctx)
 {
-	__u16 port = IRQ_PORT(irq);
-
-	uk_arch_x86_64_outb(port,
-			    uk_arch_x86_64_inb(port) & ~(1 << IRQ_OFFSET(irq)));
-}
-
-static struct uk_intctlr_driver_ops hyperlight_ops = {
-	.fdt_xlat = __NULL,
-	.mask_irq = hyperlight_mask_irq,
-	.unmask_irq = hyperlight_unmask_irq,
-	.configure_irq = configure_irq,
-};
-
-static void pic_remap(void)
-{
-	unsigned char a1, a2;
-
-	a1 = uk_arch_x86_64_inb(PIC1_DATA);
-	a2 = uk_arch_x86_64_inb(PIC2_DATA);
-
-	uk_arch_x86_64_outb(PIC1_COMMAND, ICW1_INIT + ICW1_ICW4);
-	uk_arch_x86_64_outb(PIC2_COMMAND, ICW1_INIT + ICW1_ICW4);
-	uk_arch_x86_64_outb(PIC1_DATA, 32);
-	uk_arch_x86_64_outb(PIC2_DATA, 40);
-	uk_arch_x86_64_outb(PIC1_DATA, 4);
-	uk_arch_x86_64_outb(PIC2_DATA, 2);
-	uk_arch_x86_64_outb(PIC1_DATA, ICW4_8086);
-	uk_arch_x86_64_outb(PIC2_DATA, ICW4_8086);
-
-	uk_arch_x86_64_outb(PIC1_DATA, a1);
-	uk_arch_x86_64_outb(PIC2_DATA, a2);
-}
-
-static void pic_eoi(unsigned int irq)
-{
-	if (!IRQ_ON_MASTER(irq))
-		uk_arch_x86_64_outb(PIC2_COMMAND, PIC_EOI);
-	uk_arch_x86_64_outb(PIC1_COMMAND, PIC_EOI);
-}
-
-void uk_intctlr_hyperlight_handle_irq(struct uk_lcpu_except_irq_ctx *ctx)
-{
-	uk_intctlr_irq_handle(ctx);
-}
-
-extern volatile __u64 pv_timer_saved_rip;
-extern volatile int pv_timer_preempt_pending;
-extern void pv_timer_trampoline(void);
-
-#define ELF_BASE 0x8200000ULL
-
-static volatile int preempt_diag_count;
-
-static int hyperlight_handle_irq_event(void *data)
-{
-	struct uk_lcpu_except_irq_ctx *ctx = data;
+	struct irq_handler *h;
 	__u32 irq;
+	int i;
 
 	irq = uk_lcpu_except_irq_ctx_get_irq(ctx);
-	uk_intctlr_irq_handle(ctx);
-	pic_eoi(irq);
+	UK_ASSERT(irq <= MAX_IRQ);
 
-	(void)pv_timer_preempt_pending;
+	for (i = 0; i < MAX_HANDLERS_PER_IRQ; i++) {
+		if (irq_handlers[irq][i].func == NULL)
+			break;
+		h = &irq_handlers[irq][i];
+		if (irq != ukplat_time_get_irq())
+			/* ukplat_time_get_irq() gives the IRQ reserved for a timer,
+			 * responsible to wake up cpu from halt, so it can check if
+			 * it has something to do. Effectively it is OS ticks.
+			 *
+			 * If interrupt comes not from the timer, the
+			 * chances are some work have just
+			 * arrived. Let's kick the scheduler out of
+			 * the halting loop, and let it take care of
+			 * that work.
+			 */
+			uk_or_relax(&sched_have_pending_events, 1);
 
-	return UK_EVENT_HANDLED;
+		if (h->func(h->arg) == 1)
+			return;
+	}
+	/*
+	 * Acknowledge interrupts even in the case when there was no handler for
+	 * it. We do this to (1) compensate potential spurious interrupts of
+	 * devices, and (2) to minimize impact on drivers that share one
+	 * interrupt line that would then stay disabled.
+	 */
+	trace_uk_intctlr_unhandled_irq(irq);
 }
 
-UK_EVENT_HANDLER(UK_LCPU_EXCEPT_EVENT_IRQ, hyperlight_handle_irq_event);
-
-int uk_intctlr_probe(void)
+void uk_intctlr_irq_mask(unsigned int irq)
 {
-	pic_remap();
+	UK_ASSERT(uk_intctlr && uk_intctlr->ops);
 
-	intctlr.name = "Hyperlight";
-	intctlr.ops = &hyperlight_ops;
+	return uk_intctlr->ops->mask_irq(irq);
+}
 
-	return uk_intctlr_register(&intctlr);
+void uk_intctlr_irq_unmask(unsigned int irq)
+{
+	UK_ASSERT(uk_intctlr && uk_intctlr->ops);
+
+	return uk_intctlr->ops->unmask_irq(irq);
+}
+
+int uk_intctlr_irq_configure(struct uk_intctlr_irq *irq)
+{
+	UK_ASSERT(uk_intctlr && uk_intctlr->ops);
+	UK_ASSERT(irq);
+
+	return uk_intctlr->ops->configure_irq(irq);
+}
+
+int uk_intctlr_irq_fdt_xlat(const void *fdt, int nodeoffset, __u32 index,
+			    struct uk_intctlr_irq *irq)
+{
+	UK_ASSERT(uk_intctlr && uk_intctlr->ops);
+	UK_ASSERT(fdt);
+	UK_ASSERT(irq);
+
+	/* We're using an assertion here instead of returning -ENOTSUP
+	 * because the implementation returns libfdt error codes.
+	 */
+	UK_ASSERT(uk_intctlr->ops->fdt_xlat);
+
+	return uk_intctlr->ops->fdt_xlat(fdt, nodeoffset, index, irq);
+}
+
+int uk_intctlr_irq_alloc(unsigned int *irqs, __sz count)
+{
+	unsigned long start, idx;
+
+	UK_ASSERT(irqs);
+
+	start = uk_bitmap_find_next_zero_area(irqs_allocated,
+					      ALLOCABLE_IRQ_COUNT, 0,
+					      count, 0);
+	if (start == ALLOCABLE_IRQ_COUNT)
+		return -ENOSPC;
+
+	uk_bitmap_set(irqs_allocated, start, count);
+	for (idx = start; idx < (start + count); idx++) {
+		*irqs = idx + FIRST_ALLOCABLE_IRQ;
+		irqs++;
+	}
+
+	return 0;
+}
+
+int uk_intctlr_irq_free(unsigned int *irqs, __sz count)
+{
+	int rc = 0;
+
+	UK_ASSERT(irqs);
+
+	for (__sz i = 0; i < count; i++) {
+		UK_ASSERT(irqs[i] >= FIRST_ALLOCABLE_IRQ &&
+			  irqs[i] <= LAST_ALLOCABLE_IRQ);
+
+		rc = uk_test_and_clear_bit(irqs[i] - FIRST_ALLOCABLE_IRQ,
+					   irqs_allocated);
+		UK_ASSERT(rc);
+	}
+
+	return !rc;
+}
+
+int uk_intctlr_init(struct uk_alloc *a __unused)
+{
+	UK_ASSERT(uk_intctlr);
+	UK_ASSERT(uk_lcpu_irqs_disabled());
+
+	/* Nothing for now */
+	return 0;
+}
+
+int uk_intctlr_register(struct uk_intctlr_desc *intctlr)
+{
+	UK_ASSERT(intctlr);
+
+	uk_intctlr = intctlr;
+
+	return 0;
+}
+
+int __weak uk_intctlr_plat_probe(void *arg __unused)
+{
+	return 0;
 }
