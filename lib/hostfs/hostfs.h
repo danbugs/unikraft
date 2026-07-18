@@ -48,6 +48,7 @@ int hostfs_rpc_write(const char *path, uint64_t offset,
 int hostfs_rpc_mkdir(const char *path);
 int hostfs_rpc_unlink(const char *path);
 int hostfs_rpc_truncate(const char *path, uint64_t length);
+int hostfs_rpc_rename(const char *src, const char *dst);
 
 /* Streamed readdir: caller passes an index; on success `name` is
  * filled with the N-th entry's name (null-terminated) and `is_dir`

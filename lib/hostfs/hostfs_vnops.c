@@ -330,10 +330,30 @@ static int hostfs_inactive(struct vnode *vp)
 	return 0;
 }
 
+static int hostfs_rename(struct vnode *dvp1, struct vnode *vp1 __unused,
+			 const char *sname,
+			 struct vnode *dvp2, struct vnode *vp2 __unused,
+			 const char *dname)
+{
+	struct hostfs_node *dnp1 = dvp1->v_data;
+	struct hostfs_node *dnp2 = dvp2->v_data;
+	char src[HOSTFS_MAX_PATH], dst[HOSTFS_MAX_PATH];
+	int rc;
+
+	rc = join_path(dnp1->path, sname, src, sizeof(src));
+	if (rc < 0)
+		return -rc;
+	rc = join_path(dnp2->path, dname, dst, sizeof(dst));
+	if (rc < 0)
+		return -rc;
+
+	rc = hostfs_rpc_rename(src, dst);
+	return rc < 0 ? -rc : 0;
+}
+
 #define hostfs_seek     ((vnop_seek_t)vfscore_vop_nullop)
 #define hostfs_ioctl    ((vnop_ioctl_t)vfscore_vop_einval)
 #define hostfs_fsync    ((vnop_fsync_t)vfscore_vop_nullop)
-#define hostfs_rename   ((vnop_rename_t)vfscore_vop_einval)
 #define hostfs_link     ((vnop_link_t)vfscore_vop_eperm)
 #define hostfs_fallocate ((vnop_fallocate_t)vfscore_vop_einval)
 #define hostfs_readlink ((vnop_readlink_t)vfscore_vop_einval)

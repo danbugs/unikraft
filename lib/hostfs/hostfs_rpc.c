@@ -341,6 +341,21 @@ int hostfs_rpc_truncate(const char *path, uint64_t length)
 	return rpc_exchange(n, NULL);
 }
 
+int hostfs_rpc_rename(const char *src, const char *dst)
+{
+	char sbuf[HOSTFS_MAX_PATH + 32];
+	char dbuf[HOSTFS_MAX_PATH + 32];
+	if (json_escape(src, sbuf, sizeof(sbuf)) < 0)
+		return -ENAMETOOLONG;
+	if (json_escape(dst, dbuf, sizeof(dbuf)) < 0)
+		return -ENAMETOOLONG;
+	int n = build_req(
+		"{\"name\":\"fs_rename\",\"args\":"
+		"{\"src\":%s,\"dst\":%s}}", sbuf, dbuf);
+	if (n < 0) return n;
+	return rpc_exchange(n, NULL);
+}
+
 int hostfs_rpc_readdir(const char *path, size_t index,
 		       char *name, size_t name_cap, int *is_dir_out)
 {
