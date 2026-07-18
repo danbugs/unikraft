@@ -38,7 +38,7 @@ static __u64 cow_scratch_base_gva;
 static __u64 cow_scratch_size;
 static int   cow_initialized;
 
-extern int mmap_region_is_accessible(__u64 addr);
+__u64 mmap_lazy_limit = 0x800000000ULL;
 
 static inline __u64 cow_phys_to_virt(__u64 gpa)
 {
@@ -232,12 +232,9 @@ int cow_demand_map_page_ex(__u64 gva, int zero_data)
 		volatile __u64 *ap = (volatile __u64 *)ALLOCATOR_GVA;
 		__u64 alloc_end = *ap + 4 * HL_PAGE_SIZE;
 		if (alloc_end > cow_scratch_base_gpa + cow_scratch_size) {
-			__u64 used = *ap - cow_scratch_base_gpa;
-			uk_pr_crit("DEMAND_MAP: SCRATCH EXHAUSTED gva=0x%llx "
-				   "used=%lluMiB/%lluMiB base=0x%llx\n",
-				   gva, used >> 20,
-				   cow_scratch_size >> 20,
-				   cow_scratch_base_gpa);
+			uk_pr_crit("DEMAND_MAP: SCRATCH EXHAUSTED gva=0x%llx alloc=0x%llx end=0x%llx\n",
+				   gva, alloc_end,
+				   cow_scratch_base_gpa + cow_scratch_size);
 			return 0;
 		}
 	}
@@ -605,76 +602,23 @@ static int hyperlight_cow_pf_handler(void *data)
 	if (!(error_code & 1) && cow_demand_map_file_page(fault_addr))
 		return UK_EVENT_HANDLED;
 
-	/* Lazy demand-paging for anonymous mmap regions.
-	 * Only demand-map if the faulting address is in a region that was
-	 * mmap'd with non-PROT_NONE protection. V8's 1 TiB PROT_NONE
-	 * sandbox expects SIGSEGV on uncommitted pages — demand-mapping
-	 * those would waste scratch and break sandbox bounds checking.
-	 */
+	/* Lazy demand-paging for anonymous mmap regions */
 	if (!(error_code & 1) &&
 	    fault_addr >= 0x800000000ULL &&
-	    mmap_region_is_accessible(fault_addr)) {
+	    fault_addr < mmap_lazy_limit) {
 		int dm_rc = cow_demand_map_page(fault_addr);
 		if (dm_rc)
 			return UK_EVENT_HANDLED;
-		uk_pr_crit("PF DEMAND-MAP FAILED: addr=0x%lx\n",
-			   (unsigned long)fault_addr);
+		uk_pr_crit("PF DEMAND-MAP FAILED: addr=0x%lx limit=0x%llx\n",
+			   (unsigned long)fault_addr, mmap_lazy_limit);
 	}
 
-	{
-		extern int uk_sys_getpid(void);
-		uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx pid=%d\n",
-			   (unsigned long)fault_addr, error_code,
-			   uk_lcpu_regs_get(regs, RIP),
-			   uk_sys_getpid());
-		uk_pr_crit("PF regs: rax=0x%lx rbx=0x%lx rcx=0x%lx "
-			   "rdx=0x%lx rdi=0x%lx rsi=0x%lx\n",
-			   uk_lcpu_regs_get(regs, RAX),
-			   uk_lcpu_regs_get(regs, RBX),
-			   uk_lcpu_regs_get(regs, RCX),
-			   uk_lcpu_regs_get(regs, RDX),
-			   uk_lcpu_regs_get(regs, RDI),
-			   uk_lcpu_regs_get(regs, RSI));
-		uk_pr_crit("PF regs: r8=0x%lx r9=0x%lx r10=0x%lx "
-			   "r11=0x%lx r12=0x%lx r13=0x%lx "
-			   "r14=0x%lx r15=0x%lx rbp=0x%lx\n",
-			   uk_lcpu_regs_get(regs, R8),
-			   uk_lcpu_regs_get(regs, R9),
-			   uk_lcpu_regs_get(regs, R10),
-			   uk_lcpu_regs_get(regs, R11),
-			   uk_lcpu_regs_get(regs, R12),
-			   uk_lcpu_regs_get(regs, R13),
-			   uk_lcpu_regs_get(regs, R14),
-			   uk_lcpu_regs_get(regs, R15),
-			   uk_lcpu_regs_get(regs, RBP));
-		{
-			unsigned char *ip = (unsigned char *)
-				uk_lcpu_regs_get(regs, RIP);
-			uk_pr_crit("PF insn @0x%lx: %02x %02x %02x %02x "
-				   "%02x %02x %02x %02x %02x %02x "
-				   "%02x %02x %02x %02x %02x %02x\n",
-				   (unsigned long)ip,
-				   ip[0], ip[1], ip[2], ip[3],
-				   ip[4], ip[5], ip[6], ip[7],
-				   ip[8], ip[9], ip[10], ip[11],
-				   ip[12], ip[13], ip[14], ip[15]);
-		}
-		{
-			__u64 rsp = uk_lcpu_regs_get(regs, RSP);
-			__u64 *stk = (__u64 *)rsp;
-			uk_pr_crit("PF rsp=0x%lx\n",
-				   (unsigned long)rsp);
-			uk_pr_crit("PF stack: [rsp]=0x%lx [rsp+8]=0x%lx "
-				   "[rsp+16]=0x%lx [rsp+24]=0x%lx "
-				   "[rsp+32]=0x%lx [rsp+40]=0x%lx\n",
-				   (unsigned long)stk[0],
-				   (unsigned long)stk[1],
-				   (unsigned long)stk[2],
-				   (unsigned long)stk[3],
-				   (unsigned long)stk[4],
-				   (unsigned long)stk[5]);
-		}
-	}
+	uk_pr_crit("PF UNHANDLED: addr=0x%lx err=0x%x rip=0x%lx rsp=0x%lx "
+		   "lazy_limit=0x%llx\n",
+		   (unsigned long)fault_addr, error_code,
+		   uk_lcpu_regs_get(regs, RIP),
+		   uk_lcpu_regs_get(regs, RSP),
+		   mmap_lazy_limit);
 	return UK_EVENT_NOT_HANDLED;
 }
 

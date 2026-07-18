@@ -79,6 +79,7 @@ MMAP_TIMING_EXPORT __u64 mmap_timing_pread_bytes;
  * entry, causing an unhandled "not present" page fault.
  */
 static __u64 mmap_virt_next = 0x800000000ULL; /* 32 GiB — above any heap */
+extern __u64 mmap_lazy_limit;
 
 extern int cow_demand_map_page(__u64 gva);
 extern int cow_demand_map_page_ex(__u64 gva, int zero_data);
@@ -89,51 +90,10 @@ struct mmap_addr {
 	void *begin;
 	void *end;
 	unsigned long num_pages; /* pages passed to uk_palloc; used by munmap */
-	int prot;
 	struct mmap_addr *next;
 };
 
 static struct mmap_addr *mmap_addr;
-
-#if CONFIG_PLAT_HYPERLIGHT
-static volatile int _mmap_lock;
-
-static inline void mmap_lock(void)
-{
-	while (__sync_lock_test_and_set(&_mmap_lock, 1))
-		__asm__ volatile("pause" ::: "memory");
-}
-
-static inline void mmap_unlock(void)
-{
-	__sync_lock_release(&_mmap_lock);
-}
-#else
-#define mmap_lock()   do {} while (0)
-#define mmap_unlock() do {} while (0)
-#endif
-
-#if CONFIG_PLAT_HYPERLIGHT
-int mmap_region_is_accessible(__u64 addr)
-{
-	struct mmap_addr *tmp = mmap_addr;
-
-	while (tmp) {
-		if ((__u64)tmp->begin <= addr && addr < (__u64)tmp->end) {
-			if (tmp->prot == PROT_NONE && addr >= 0x1000000000ULL)
-				uk_pr_crit("ACCESSIBLE: 0x%lx in [0x%lx,0x%lx) PROT_NONE\n",
-					   (unsigned long)addr,
-					   (__u64)tmp->begin, (__u64)tmp->end);
-			return tmp->prot != PROT_NONE;
-		}
-		tmp = tmp->next;
-	}
-	if (addr >= 0x1000000000ULL)
-		uk_pr_crit("ACCESSIBLE: 0x%lx NOT IN ANY REGION\n",
-			   (unsigned long)addr);
-	return 0;
-}
-#endif
 
 /**
  * This is not a correct implementation of mmap. It is just a trick that works
@@ -156,7 +116,7 @@ int mmap_region_is_accessible(__u64 addr)
 UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 		int, flags, int, fildes, off_t, off)
 {
-	struct mmap_addr *tmp, *last = NULL, *new = NULL;
+	struct mmap_addr *tmp = mmap_addr, *last = NULL, *new = NULL;
 
 	if (!len) {
 		errno = EINVAL;
@@ -164,9 +124,17 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 	}
 
 #if CONFIG_PLAT_HYPERLIGHT
+	/* On Hyperlight, accept file-backed mappings (fildes != -1) for the
+	 * dynamic linker to load shared libraries.  Accept both MAP_PRIVATE
+	 * and MAP_SHARED — in a unikernel there is only one address space,
+	 * so SHARED semantics are identical to PRIVATE.
+	 */
 	if (!(flags & (MAP_PRIVATE | MAP_SHARED)))
 		return MAP_FAILED;
 #else
+	/* Check if parameters match the ones that go use
+	 * Otherwise return 0 (unimplemented mmap)
+	 */
 	if (fildes != -1 || off)
 		return MAP_FAILED;
 	if (!(prot & (PROT_READ|PROT_WRITE)) && (prot != 0))
@@ -177,23 +145,15 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 		return MAP_FAILED;
 #endif
 
-	mmap_lock();
-	tmp = mmap_addr;
-
 	while (tmp) {
 		if (addr) {
 			if (addr >= tmp->begin && addr < tmp->end) {
 #if CONFIG_PLAT_HYPERLIGHT
-				/* Commit within an existing reservation (MAP_FIXED
-				 * or hint-based): demand-map each page from scratch
-				 * so the virtual address is backed by a real page.
-				 * Track the sub-region with its actual protection so
-				 * that later page faults (e.g. from a child process
-				 * after vfork/execve) can be demand-mapped correctly.
+				/* MAP_FIXED commit within an existing reservation:
+				 * demand-map each page from scratch so the virtual
+				 * address is backed by a real, zeroed page.
 				 */
-				if (prot != PROT_NONE) {
-					size_t aligned_len = (len + __PAGE_SIZE - 1)
-							     & ~(__PAGE_SIZE - 1);
+				if ((flags & MAP_FIXED) && (prot != PROT_NONE)) {
 					size_t pg_off;
 					for (pg_off = 0; pg_off < len;
 					     pg_off += __PAGE_SIZE)
@@ -203,19 +163,8 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 						pread(fildes, addr, len, off);
 					else
 						memset(addr, 0, len);
-					new = uk_malloc(uk_alloc_get_default(),
-							sizeof(struct mmap_addr));
-					if (new) {
-						new->begin = addr;
-						new->end = addr + aligned_len;
-						new->num_pages = 0;
-						new->prot = prot;
-						new->next = mmap_addr;
-						mmap_addr = new;
-					}
 				}
 #endif
-				mmap_unlock();
 				return addr;
 			}
 		}
@@ -228,7 +177,6 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 	 * Return MAP_FAILED so callers can fall back to a hint-based allocation.
 	 */
 	if ((flags & MAP_FIXED) && addr) {
-		mmap_unlock();
 		errno = ENOMEM;
 		return MAP_FAILED;
 	}
@@ -256,40 +204,31 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 				sizeof(struct mmap_addr));
 		if (!new) {
 			mmap_virt_next -= aligned_len;
-			mmap_unlock();
 			errno = ENOMEM;
 			return MAP_FAILED;
 		}
 
 		__u64 _t0 = ukplat_monotonic_clock();
 		new->begin = mem;
-		new->end = mem + aligned_len;
+		new->end = mem + len;
 		new->num_pages = 0; /* virtual-only: no buddy pages to free */
-		new->prot = prot;
 		new->next = NULL;
 		if (!mmap_addr)
 			mmap_addr = new;
 		else
 			last->next = new;
-		if (prot == PROT_NONE && aligned_len >= 0x40000000ULL)
-			uk_pr_crit("MMAP RESERVE: [0x%lx,0x%lx) len=0x%lx\n",
-				   (__u64)mem, (__u64)(mem + aligned_len),
-				   (unsigned long)aligned_len);
 		__u64 _t1 = ukplat_monotonic_clock();
 		mmap_timing_bookkeep_ns += (_t1 - _t0);
 		mmap_timing_calls++;
 
 		if (prot != PROT_NONE) {
-			if (fildes != -1) {
-				if (!cow_map_contiguous((__u64)mem,
-						       aligned_len / __PAGE_SIZE,
-						       1)) {
-					mmap_virt_next -= aligned_len;
-					uk_free(uk_alloc_get_default(), new);
-					mmap_unlock();
-					errno = ENOMEM;
-					return MAP_FAILED;
-				}
+			if (!cow_map_contiguous((__u64)mem,
+					       aligned_len / __PAGE_SIZE,
+					       1)) {
+				mmap_virt_next -= aligned_len;
+				uk_free(uk_alloc_get_default(), new);
+				errno = ENOMEM;
+				return MAP_FAILED;
 			}
 			__u64 _t2 = ukplat_monotonic_clock();
 			mmap_timing_pgloop_ns += (_t2 - _t1);
@@ -375,7 +314,6 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 			mmap_timing_pread_ns += (_t3 - _t2);
 		}
 
-		mmap_unlock();
 		return mem;
 	}
 #else /* !CONFIG_PLAT_HYPERLIGHT */
@@ -425,7 +363,7 @@ UK_SYSCALL_DEFINE(void*, mmap, void*, addr, size_t, len, int, prot,
 
 UK_SYSCALL_DEFINE(int, munmap, void*, addr, size_t, len)
 {
-	struct mmap_addr *tmp, *prev = NULL;
+	struct mmap_addr *tmp = mmap_addr, *prev = NULL;
 
 	if (!len) {
 		errno = EINVAL;
@@ -435,16 +373,16 @@ UK_SYSCALL_DEFINE(int, munmap, void*, addr, size_t, len)
 	if (!addr)
 		return 0;
 
-	mmap_lock();
-	tmp = mmap_addr;
-
 	while (tmp) {
 		if (addr >= tmp->begin && addr < tmp->end) {
-			if (len != (__uptr)tmp->end - (__uptr)tmp->begin) {
-				mmap_unlock();
+			/* We cannot release only some part of the allocation.
+			 * In that case, pretend we have done it and hope
+			 * everything will be fine
+			 */
+			if (len != (__uptr)tmp->end - (__uptr)tmp->begin)
 				return 0;
-			}
 
+			/* Caller wants to unmap the whole region. Easy! */
 			if (!prev)
 				mmap_addr = tmp->next;
 			else
@@ -454,7 +392,7 @@ UK_SYSCALL_DEFINE(int, munmap, void*, addr, size_t, len)
 			uk_free(uk_alloc_get_default(), tmp);
 			if (np > 0)
 				uk_pfree(uk_alloc_get_default(), addr, np);
-			mmap_unlock();
+			/* np == 0: virtual-only region, no buddy pages to free */
 			return 0;
 		}
 
@@ -462,7 +400,7 @@ UK_SYSCALL_DEFINE(int, munmap, void*, addr, size_t, len)
 		tmp = tmp->next;
 	}
 
-	mmap_unlock();
+	/* No matching region found. But it is ok anyway */
 	return 0;
 }
 
@@ -531,53 +469,18 @@ UK_SYSCALL_R_DEFINE(int, madvise, void*, addr, size_t, length, int, advice)
 UK_SYSCALL_R_DEFINE(int, mprotect, void*, addr, size_t, len, int, prot)
 {
 #if CONFIG_PLAT_HYPERLIGHT
-	size_t aligned_len = (len + __PAGE_SIZE - 1) & ~(__PAGE_SIZE - 1);
-	__u64 base = (__u64)addr & ~(__PAGE_SIZE - 1);
-
+	/* When transitioning from PROT_NONE to readable/writable, back the
+	 * virtual pages with scratch memory.  This is needed because V8
+	 * uses mmap(PROT_NONE) + mprotect(PROT_READ|PROT_WRITE) to commit
+	 * memory regions.
+	 */
 	if (prot != PROT_NONE) {
 		size_t pg_off;
+		size_t aligned_len = (len + __PAGE_SIZE - 1) & ~(__PAGE_SIZE - 1);
+		__u64 base = (__u64)addr & ~(__PAGE_SIZE - 1);
 		for (pg_off = 0; pg_off < aligned_len; pg_off += __PAGE_SIZE)
 			cow_demand_map_page(base + pg_off);
 	}
-
-	/* Create a sub-region entry so mmap_region_is_accessible tracks
-	 * the actual protection.  Prepending means the most recent entry
-	 * for any address wins during lookup.
-	 */
-	mmap_lock();
-	struct mmap_addr *tmp = mmap_addr;
-	int found = 0;
-	while (tmp) {
-		if ((void *)addr >= tmp->begin &&
-		    (void *)addr < tmp->end) {
-			found = 1;
-			/* If the entry covers exactly this range, just
-			 * update its prot in place.
-			 */
-			if (tmp->begin == (void *)base &&
-			    tmp->end == (void *)(base + aligned_len)) {
-				tmp->prot = prot;
-				break;
-			}
-			/* Otherwise create a sub-region entry so the
-			 * parent's prot stays untouched.
-			 */
-			struct mmap_addr *sub = uk_malloc(
-				uk_alloc_get_default(),
-				sizeof(struct mmap_addr));
-			if (sub) {
-				sub->begin = (void *)base;
-				sub->end = (void *)(base + aligned_len);
-				sub->num_pages = 0;
-				sub->prot = prot;
-				sub->next = mmap_addr;
-				mmap_addr = sub;
-			}
-			break;
-		}
-		tmp = tmp->next;
-	}
-	mmap_unlock();
 #endif
 	return 0;
 }

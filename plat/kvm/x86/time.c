@@ -1,69 +1,89 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-/*
- * Authors: Dan Williams
- *          Martin Lucina
- *          Ricardo Koller
- *          Costin Lupu <costin.lupu@cs.pub.ro>
- *          Simon Kuenzer <simon.kuenzer@neclab.eu>
- *          Wei Chen <wei.chen@arm.com>
- *
- * Copyright (c) 2015-2017 IBM
- * Copyright (c) 2016-2017 Docker, Inc.
- * Copyright (c) 2017-2018, NEC Europe Ltd., NEC Corporation
- * Copyright (c) 2018, Arm Ltd. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+/* Copyright (c) 2024, Unikraft GmbH and The Unikraft Authors.
+ * Licensed under the BSD-3-Clause License (the "License").
+ * You may not use this file except in compliance with the License.
  */
 
 #include <stdlib.h>
+#include <string.h>
 #include <uk/plat/time.h>
+#include <uk/lcpu.h>
 #include <uk/intctlr.h>
-#include <kvm/tscclock.h>
 #include <uk/assert.h>
+#include <uk/atomic.h>
+#include <uk/arch/x86_64.h>
+#include <hyperlight-x86/setup.h>
+#include <hyperlight-x86/hcall.h>
+#include <uk/sched.h>
 
-/* return ns since time_init() */
+/* TSC frequency in Hz - will be calibrated at init */
+static __u64 tsc_freq;
+static __u64 tsc_start;
+
+/* Used by scheduler to signal pending events */
+unsigned long sched_have_pending_events;
+
+/* PV timer preemption state — single vCPU, no locking needed */
+volatile __u64 pv_timer_saved_rip;
+volatile __u64 pv_timer_return_rip;
+volatile int pv_timer_preempt_pending;
+
+void pv_timer_yield(void)
+{
+	uk_sched_yield();
+}
+
+/* Simple TSC-based monotonic clock */
 __nsec ukplat_monotonic_clock(void)
 {
-	return tscclock_monotonic();
+	__u64 tsc_now = uk_arch_x86_64_rdtsc();
+	__u64 tsc_delta = tsc_now - tsc_start;
+
+	if (tsc_freq == 0)
+		return 0;
+
+	/* Split to avoid overflow (uint64 * 10^9 overflows after ~7s at 2.5 GHz) */
+	__u64 secs = tsc_delta / tsc_freq;
+	__u64 rem  = tsc_delta % tsc_freq;
+	return secs * 1000000000ULL + (rem * 1000000000ULL) / tsc_freq;
 }
 
-/* return wall time in nsecs */
+/* Wall time in ns since the Unix epoch.
+ *
+ * Hyperlight guests have no real-time clock — we get the wall time
+ * from the host at VM boot (init_data HLWALL0 TLV) and add our own
+ * monotonic delta on top. After a snapshot/restore both components
+ * roll back, so the guest sees the same "epoch" on every warm run;
+ * that's fine for things like xlsx timestamps (>=1980) and logging
+ * deltas within a run, but it is NOT a real-time wall clock.
+ */
 __nsec ukplat_wall_clock(void)
 {
-	return tscclock_monotonic() + tscclock_epochoffset();
+	return hyperlight_wall_boot_ns_from_host() + ukplat_monotonic_clock();
 }
 
-/* NB: If this ever does more than an immediate return, it will need to be
- * compiled with NO_X86_EXTREGS_FLAGS to prevent potential clobbering of
- * registers that are not saved on interrupt handling.
- */
+static volatile int timer_fire_count;
+
 static int timer_handler(void *arg __unused)
 {
-	/* Yes, we handled the irq. */
+	pv_timer_preempt_pending = 1;
+	timer_fire_count++;
+	if (timer_fire_count <= 3)
+		uk_pr_crit("PV_TIMER: IRQ fired (%d)\n", timer_fire_count);
 	return 1;
+}
+
+/* Estimate TSC frequency using a simple loop.
+ * This is a rough estimate - Hyperlight guests don't have access to
+ * PIT or other timing hardware for calibration.
+ */
+static void estimate_tsc_freq(void)
+{
+	/* Assume a reasonable default frequency of 2.5 GHz
+	 * This can be improved if Hyperlight passes the TSC frequency
+	 * to the guest in the PEB.
+	 */
+	tsc_freq = 2500000000ULL;
 }
 
 /* must be called before interrupts are enabled */
@@ -75,9 +95,8 @@ void ukplat_time_init(void)
 	if (rc < 0)
 		UK_CRASH("Failed to register timer interrupt handler\n");
 
-	rc = tscclock_init();
-	if (rc < 0)
-		UK_CRASH("Failed to initialize TSCCLOCK\n");
+	tsc_start = uk_arch_x86_64_rdtsc();
+	estimate_tsc_freq();
 }
 
 void ukplat_time_fini(void)
@@ -88,3 +107,74 @@ __u32 ukplat_time_get_irq(void)
 {
 	return 0;
 }
+
+#ifdef CONFIG_HYPERLIGHT_HCALL
+/*
+ * Call __hl_sleep via hcall. On the host this now also polls all sockets
+ * in the socket table, returning early with "socket_ready":true when a
+ * socket event occurs.  Returns 1 if sockets became ready, 0 otherwise.
+ */
+static int hyperlight_sleep_ns(__u64 ns)
+{
+	static char _req[128];
+	static char _resp[256];
+	__sz resp_len = 0;
+	int n = snprintf(_req, sizeof(_req),
+			 "{\"name\":\"__hl_sleep\",\"args\":{\"ns\":%llu}}",
+			 (unsigned long long)ns);
+	if (n < 0 || (__sz)n >= sizeof(_req))
+		return 0;
+	if (hyperlight_hcall((const __u8 *)_req, (__sz)n,
+			     (__u8 *)_resp, sizeof(_resp) - 1,
+			     &resp_len) < 0)
+		return 0;
+	_resp[resp_len] = '\0';
+	return strstr(_resp, "\"socket_ready\":true") != NULL;
+}
+
+#ifdef CONFIG_LIBHOSTSOCK
+extern int hostsock_rescan_events(void);
+#endif
+
+/* Block CPU until the specified time or pending events.
+ *
+ * Yield to other runnable threads instead of sleeping the VM so that
+ * vfork children (e.g. the VS Code extension host) keep making
+ * progress while the parent polls for network I/O.
+ */
+static void pv_timer_init_once(void)
+{
+	static int done;
+	if (done)
+		return;
+	done = 1;
+	uk_pr_crit("PV_TIMER: disabled (using syscall-boundary yield)\n");
+}
+
+void time_block_until(__snsec until)
+{
+	pv_timer_init_once();
+
+	while ((__snsec)ukplat_monotonic_clock() < until) {
+		/* Brief host-side poll so inbound connections get proxied. */
+		if (hyperlight_sleep_ns(100000))  /* 100 µs */
+			break;
+#ifdef CONFIG_LIBHOSTSOCK
+		if (hostsock_rescan_events())
+			break;
+#endif
+		uk_sched_yield();
+	}
+}
+#else
+/* Block CPU until the specified time or pending events */
+void time_block_until(__snsec until)
+{
+	while ((__snsec) ukplat_monotonic_clock() < until) {
+		uk_lcpu_halt_irq();
+
+		if (uk_and_relax(&sched_have_pending_events, 0))
+			break;
+	}
+}
+#endif
