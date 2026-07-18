@@ -127,8 +127,21 @@ extern int hostsock_rescan_events(void);
  * vfork children (e.g. the VS Code extension host) keep making
  * progress while the parent polls for network I/O.
  */
+static void pv_timer_init_once(void)
+{
+	static int done;
+	if (done)
+		return;
+	done = 1;
+	__u32 period_us = 10000;
+	__asm__ volatile("outl %0, %1"
+			 : : "a"(period_us), "Nd"((__u16)107));
+}
+
 void time_block_until(__snsec until)
 {
+	pv_timer_init_once();
+
 	while ((__snsec)ukplat_monotonic_clock() < until) {
 		uk_sched_yield();
 #ifdef CONFIG_LIBHOSTSOCK
