@@ -49,6 +49,15 @@ static void uk_sigact_term(int __unused sig)
 	pprocess = uk_pprocess_current();
 	UK_ASSERT(pprocess);
 
+#ifdef CONFIG_HYPERLIGHT_HCALL
+	{
+		extern int _hostsock_listener_pid;
+		if (_hostsock_listener_pid > 0 &&
+		    pprocess->pid == _hostsock_listener_pid)
+			return;
+	}
+#endif
+
 	uk_pr_info("pid: %d terminated by signal\n", pprocess->pid);
 
 	pprocess_exit(pprocess, POSIX_PROCESS_KILLED, sig);
@@ -501,19 +510,13 @@ void sys_error_handler(struct ukarch_execenv *ee __unused, long arg)
 		goto err_panic;
 	}
 
-	/* Prepare siginfo — use hardware-fault codes so signal handlers
-	 * (e.g. V8's SIGSEGV handler) can distinguish faults from kill().
-	 */
-	sig.siginfo.si_signo = error->signum;
-	if (error->signum == SIGSEGV) {
-		sig.siginfo.si_code = SEGV_MAPERR;
-		sig.siginfo.si_addr = (void *)error->vaddr;
-	} else if (error->signum == SIGBUS) {
-		sig.siginfo.si_code = BUS_ADRERR;
-		sig.siginfo.si_addr = (void *)error->vaddr;
-	} else {
-		sig.siginfo.si_code = SI_KERNEL;
-	}
+	uk_pr_crit("SIG_DELIVER: delivering sig=%d handler=0x%lx vaddr=0x%lx\n",
+		   error->signum,
+		   (unsigned long)KERN_SIGACTION(pproc, error->signum)->ks_handler,
+		   (unsigned long)error->vaddr);
+
+	/* Prepare siginfo */
+	set_siginfo_kill(error->signum, &sig.siginfo);
 
 	/* Execute standard delivery path */
 	do_deliver(pthread, &sig, ee);
