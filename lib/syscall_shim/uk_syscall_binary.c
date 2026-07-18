@@ -43,8 +43,6 @@
 #include <uk/prio.h>
 #include <uk/thread.h>
 #include <uk/sched.h>
-#include <uk/lcpu/except.h>
-#include <uk/plat/time.h>
 #if CONFIG_LIBSYSCALL_SHIM_STRACE
 #include <uk/print.h>
 #endif /* CONFIG_LIBSYSCALL_SHIM_STRACE */
@@ -109,6 +107,10 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 	_UK_EXECENV_REGS_SET(execenv, __syscall_rret0,
 			     uk_syscall6_do_e(execenv));
 
+#ifdef CONFIG_HYPERLIGHT_HCALL
+	uk_sched_yield();
+#endif
+
 	uk_syscall_exit_ctx_init(&exit_ctx,
 				 execenv, uk_syscall_nested_depth,
 				 UK_SYSCALL_EXIT_CTX_BINARY_SYSCALL);
@@ -119,16 +121,6 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 	t->tlsp = uk_lcpu_sysctx_get(execenv->sysctx, TLSP);
 #endif /* CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS */
 
-	{
-		static __nsec last_yield_ns;
-		__nsec now = ukplat_monotonic_clock();
-
-		if (now - last_yield_ns > 1000000) {
-			last_yield_ns = now;
-			uk_lcpu_irqs_handle_pending();
-			uk_sched_yield();
-		}
-	}
 }
 
 #if CONFIG_LIBSYSCALL_SHIM_DEBUG_HANDLER
