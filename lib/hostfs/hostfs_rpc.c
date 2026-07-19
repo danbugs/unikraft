@@ -368,11 +368,15 @@ int hostfs_rpc_readdir(const char *path, size_t index,
 	int rc = rpc_exchange(n, NULL);
 	if (rc < 0) return rc;
 
-	/* Walk "name":"..." occurrences; the N-th is the result. */
+	/* Walk "name":"..." occurrences; the N-th is the result.
+	 * Note: serde_json serializes keys alphabetically (BTreeMap),
+	 * so "is_dir" precedes "name" in each entry — search backward.
+	 */
 	const char *p = rpc_resp_buf;
 	size_t seen = 0;
 	const char marker[] = "\"name\":\"";
 	while ((p = strstr(p, marker)) != NULL) {
+		const char *name_pos = p;
 		p += sizeof(marker) - 1;
 		if (seen == index) {
 			size_t o = 0;
@@ -388,16 +392,23 @@ int hostfs_rpc_readdir(const char *path, size_t index,
 				name[o++] = c;
 			}
 			name[o] = '\0';
-			/* Also find the matching "is_dir" — scan ahead until
-			 * the end of this entry (next "},{" or "}]").
+			/* Find "is_dir" within THIS entry. Keys are alphabetical
+			 * so "is_dir" precedes "name" — search backward to '{'.
 			 */
-			const char *dir_marker = strstr(p, "\"is_dir\":");
 			*is_dir_out = 0;
-			if (dir_marker) {
-				const char *v = dir_marker + 9;
-				while (*v == ' ') v++;
-				if (!strncmp(v, "true", 4))
-					*is_dir_out = 1;
+			const char *obj = name_pos;
+			while (obj > rpc_resp_buf && *obj != '{')
+				obj--;
+			const char *s = obj;
+			while (s < name_pos) {
+				if (!strncmp(s, "\"is_dir\":", 9)) {
+					const char *v = s + 9;
+					while (*v == ' ') v++;
+					if (!strncmp(v, "true", 4))
+						*is_dir_out = 1;
+					break;
+				}
+				s++;
 			}
 			return 0;
 		}
