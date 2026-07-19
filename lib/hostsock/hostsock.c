@@ -732,6 +732,12 @@ static ssize_t hostsock_recvfrom(posix_sock *sock,
 
 do_recv:
 
+	/* Cap so base64-encoded response fits in rpc_resp (65536 bytes).
+	 * 48000 raw → 64000 base64, leaving room for JSON envelope.
+	 */
+	if (len > 48000)
+		len = 48000;
+
 	int n = build_req(
 		"{\"name\":\"net_recvfrom\",\"args\":"
 		"{\"fd\":%u,\"len\":%zu,\"flags\":%d}}",
