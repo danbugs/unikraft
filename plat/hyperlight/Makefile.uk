@@ -27,5 +27,8 @@ LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/memory.c|common
 LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/bootinfo.c|common
 LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/bootinfo.lds.S|common
 
+## x86 sources
+LIBHYPERLIGHTPLAT_SRCS-$(CONFIG_ARCH_X86_64) += $(LIBHYPERLIGHTPLAT_BASE)/x86/pagetable64.S
+
 ## Linker script (processed as a source for dependency tracking)
 LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_HYPERLIGHT_DEF_LDS)
