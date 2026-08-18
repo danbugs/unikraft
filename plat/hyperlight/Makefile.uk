@@ -1,0 +1,31 @@
+$(eval $(call addplat_s,hyperlight,$(CONFIG_PLAT_HYPERLIGHT)))
+$(eval $(call addplatlib,hyperlight,libhyperlightplat))
+
+##
+## Platform library include paths and flags
+##
+LIBHYPERLIGHTPLAT_ASINCLUDES-y += -I$(LIBHYPERLIGHTPLAT_BASE)/include
+LIBHYPERLIGHTPLAT_ASINCLUDES-y += -I$(UK_PLAT_COMMON_BASE)/include
+LIBHYPERLIGHTPLAT_CINCLUDES-y  += -I$(LIBHYPERLIGHTPLAT_BASE)/include
+LIBHYPERLIGHTPLAT_CINCLUDES-y  += -I$(UK_PLAT_COMMON_BASE)/include
+LIBHYPERLIGHTPLAT_CINCLUDES-y  += -I$(UK_PLAT_DRIVERS_BASE)/include
+
+LIBHYPERLIGHTPLAT_ASFLAGS  += -DHYPERLIGHTPLAT -DUK_USE_SECTION_SEGMENTS
+LIBHYPERLIGHTPLAT_CFLAGS   += -DHYPERLIGHTPLAT -DUK_USE_SECTION_SEGMENTS
+LIBHYPERLIGHTPLAT_CXXFLAGS += -DHYPERLIGHTPLAT -DUK_USE_SECTION_SEGMENTS
+
+##
+## Default linker script
+##
+UK_PLAT_HYPERLIGHT_DEF_LDS := $(CONFIG_UK_BASE)/plat/hyperlight/x86/link64.lds.S
+
+##
+## Platform sources — added incrementally as each component is implemented.
+##
+## Common platform sources
+LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/memory.c|common
+LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/bootinfo.c|common
+LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/bootinfo.lds.S|common
+
+## Linker script (processed as a source for dependency tracking)
+LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_HYPERLIGHT_DEF_LDS)
