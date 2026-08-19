@@ -95,10 +95,23 @@ static void _ukplat_entry(struct ukplat_bootinfo *bi)
 	void *bstack;
 	int rc;
 
-	/* Initialize LCPU of bootstrap processor */
+	/* Initialize LCPU of bootstrap processor.
+	 * This installs the native PAL's full IDT, replacing the
+	 * minimal 1-entry IDT from entry64.S.
+	 */
 	rc = uk_lcpu_init(uk_pcpuvar_current_ptr_get(uk_lcpus));
 	if (unlikely(rc))
 		UK_CRASH("Bootstrap processor init failed: %d\n", rc);
+
+	/* Switch from asm CoW handler to C event-based handler.
+	 * Must be after uk_lcpu_init() since page faults now go
+	 * through the native PAL's event system.
+	 */
+	{
+		extern void hyperlight_cow_init(void);
+
+		hyperlight_cow_init();
+	}
 
 	/* Execute early init */
 	uk_boot_early_init(bi);

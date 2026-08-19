@@ -46,4 +46,12 @@
 #define PTE_ADDR_MASK	0x000FFFFFFFFFF000ULL /* bits 51:12 */
 #define PTE_AVL_COW	(1ULL << 9)           /* software CoW marker */
 
+/*
+ * Maximum guest physical / virtual addresses.  The scratch region
+ * sits at the top of the 40-bit GPA space; the GVA alias is just
+ * below the canonical hole.
+ */
+#define HL_MAX_GPA	0x0000000FFFFFFFFFULL
+#define HL_MAX_GVA	HL_SCRATCH_TOP_GVA
+
 #endif /* __HYPERLIGHT_MEM_H__ */
