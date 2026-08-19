@@ -84,16 +84,31 @@ static void __noreturn ukplat_entry2(void *arg __unused)
 	UK_BUG(); /* noreturn */
 }
 
-/*
- * TODO: Pre-fault IST exception stacks before LCPU init so that
- * the GDT/TSS/IDT setup (which writes to BSS) doesn't fault on
- * CoW pages after the asm handler is replaced by the C trap handler.
- * For now, the asm CoW handler from entry64.S handles these faults.
- */
 static void _ukplat_entry(struct ukplat_bootinfo *bi)
 {
 	void *bstack;
 	int rc;
+
+	/*
+	 * Pre-fault the native PAL's IST exception stacks before
+	 * uk_lcpu_init() replaces the IDT.  The stacks live in BSS
+	 * (CoW); if we don't fault the pages in now, the first page
+	 * fault after lidt would try to push onto a read-only IST
+	 * stack → double fault → triple fault.
+	 */
+	{
+		volatile __u8 *p;
+		/* 3 IST stacks, each CPU_EXCEPT_STACK_SIZE (PAGE_SIZE << order) */
+		__sz total = 3UL * (__PAGE_SIZE <<
+				    CONFIG_CPU_EXCEPT_STACK_SIZE_PAGE_ORDER);
+		__sz i;
+
+		p = (volatile __u8 *)uk_pal_except_get_except_stack_base();
+		for (i = 0; i < total; i += __PAGE_SIZE) {
+			__u8 tmp = *(p + i);
+			*(volatile __u8 *)(p + i) = tmp;
+		}
+	}
 
 	/* Initialize LCPU of bootstrap processor.
 	 * This installs the native PAL's full IDT, replacing the
@@ -137,18 +152,21 @@ static void _ukplat_entry(struct ukplat_bootinfo *bi)
 
 	/*
 	 * Pre-fault the new boot stack for CoW before switching.
-	 * Without this, the first push after switching RSP would
-	 * fault on a read-only CoW page.
+	 * The allocator returns heap memory from the PEB, which
+	 * Hyperlight maps as CoW.  Without pre-faulting, the first
+	 * push after switching RSP faults on a read-only page.
 	 */
 	{
-		volatile __u8 *sp = (volatile __u8 *)bstack;
-		__u8 tmp = *(sp - 8);
+		volatile __u8 *p = (volatile __u8 *)bstack;
+		__sz i;
 
-		*(volatile __u8 *)(sp - 8) = tmp;
+		for (i = __PAGE_SIZE; i <= __STACK_SIZE; i += __PAGE_SIZE) {
+			__u8 tmp = *(p - i);
+			*(volatile __u8 *)(p - i) = tmp;
+		}
 	}
 
 	/* Switch away from the bootstrap stack */
-	uk_pr_info("Switch from bootstrap stack to stack @%p\n", bstack);
 	uk_arch_x86_64_jump_to((__u64)bstack, (__u64)ukplat_entry2);
 }
 
@@ -170,11 +188,6 @@ void hyperlight_entry(struct uk_lcpu *lcpu __unused,
 	g_peb = (struct hyperlight_peb *)entry_args->peb_address;
 	if (unlikely(!g_peb))
 		UK_CRASH("PEB address is NULL\n");
-
-	uk_pr_info("Hyperlight: PEB @ %p\n", g_peb);
-	uk_pr_info("  heap:  ptr=0x%lx size=0x%lx\n",
-		   (unsigned long)g_peb->guest_heap.ptr,
-		   (unsigned long)g_peb->guest_heap.size);
 
 	/* Get bootinfo (pre-populated by linker via bootinfo.lds.S) */
 	bi = ukplat_bootinfo_get();

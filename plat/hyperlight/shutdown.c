@@ -36,6 +36,8 @@ static int hyperlight_shutdown(void)
 	 * outl already stops the vCPU.
 	 */
 	__asm__ volatile(
+		/* Hyperlight checks RSP alignment after halt */
+		"andq $~0xf, %%rsp\n\t"
 		"xorl %%eax, %%eax\n\t"
 		"movw $108, %%dx\n\t"
 		"outl %%eax, %%dx\n\t"

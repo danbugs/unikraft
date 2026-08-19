@@ -17,12 +17,12 @@
 #define UK_SEGMENT_TLS_LOAD
 
 /*
- * Hyperlight loads the guest ELF at BASE_ADDRESS (0x1000, defined in
+ * Hyperlight loads guest code at BASE_ADDRESS (0x1000, defined in
  * hyperlight-host layout.rs).  Address 0x0 is a NULL guard page.
- * We link from 0x0 so that e_entry is a file offset — Hyperlight
- * adds BASE_ADDRESS at load time.
+ * We link at the actual load address so absolute references in
+ * non-PIE code resolve correctly without relocations.
  */
-#define BASE_ADDR 0x0
+#define BASE_ADDR 0x1000
 
 /*
  * Program headers.  Hyperlight reads these to determine memory
