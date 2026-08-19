@@ -1,0 +1,5 @@
+$(eval $(call addlib_s,libukintctlr_hyperlight,$(CONFIG_LIBUKINTCTLR_HYPERLIGHT)))
+
+LIBUKINTCTLR_HYPERLIGHT_CINCLUDES-y += -I$(CONFIG_UK_BASE)/plat/common/include
+
+LIBUKINTCTLR_HYPERLIGHT_SRCS-y += $(LIBUKINTCTLR_HYPERLIGHT_BASE)/ukintctlr.c
