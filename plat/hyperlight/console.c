@@ -7,28 +7,38 @@
 /*
  * Hyperlight console driver.
  *
- * Output currently uses DebugPrint (port 103) — one VM exit per byte,
- * output appears on the host's stderr.  This is a fallback path: it
- * requires no shared-memory setup and works even before the FlatBuffer
- * host-call protocol is initialised, which makes it suitable for early
- * boot diagnostics and error paths.
+ * Two output paths:
  *
- * TODO: Once the FlatBuffer dispatch infrastructure is in place,
- * switch the primary output path to HostPrint (a host function call
- * over shared memory).  HostPrint batches the entire buffer in a
- * single VM exit, so it is significantly faster.  DebugPrint should
- * then be reserved for pre-dispatch-init output and crash paths.
+ *   1. DebugPrint (port 103) — one VM exit per byte.  Available from
+ *      the very first instruction; used during early boot before the
+ *      hcall subsystem is initialised.  Also the fallback if HostPrint
+ *      fails.
+ *
+ *   2. HostPrint (host function call) — one VM exit per buffer.  Uses
+ *      the FlatBuffer-based hcall protocol over the PEB's shared I/O
+ *      stacks.  Requires hl_hcall_init() to have been called.
+ *
+ * The console transparently picks HostPrint when the hcall subsystem
+ * is ready, falling back to DebugPrint otherwise.
  *
  * Hyperlight does not provide console input — the guest runs
  * non-interactively — so console_in always returns 0.
  */
 
 #include <uk/console/driver.h>
+#include <hyperlight-x86/hcall.h>
 #include <hyperlight-x86/outb.h>
 
 static __ssz hyperlight_console_out(struct uk_console *dev __unused,
 				    const char *buf, __sz len)
 {
+	/* Try HostPrint first — one VM exit for the entire buffer */
+	if (hl_hcall_ready()) {
+		if (hl_call_host_print(buf, len) == 0)
+			return len;
+	}
+
+	/* Fallback: DebugPrint, one byte at a time */
 	for (__sz i = 0; i < len; i++)
 		hyperlight_debug_putc(buf[i]);
 	return len;

@@ -31,6 +31,7 @@
 #include <uk/plat/common/sections.h>
 #include <uk/plat/common/bootinfo.h>
 
+#include <hyperlight-x86/hcall.h>
 #include <hyperlight-x86/peb.h>
 #include <hyperlight-x86/setup.h>
 
@@ -43,8 +44,10 @@ extern struct hyperlight_entry_args hyperlight_entry_args;
 /* Global PEB pointer — other modules may need it later */
 static struct hyperlight_peb *g_peb;
 
-/* TODO: Support passing a command line from the host wrapper. */
-static const char hyperlight_cmdline[] = "unikraft-hyperlight";
+/* Command line buffer — populated from the host via hcall at boot.
+ * Falls back to a default if the host doesn't provide GetCmdLine.
+ */
+static char hyperlight_cmdline[4096] = "unikraft-hyperlight";
 
 /**
  * Register PEB memory regions in bootinfo.
@@ -197,10 +200,26 @@ void hyperlight_entry(struct uk_lcpu *lcpu __unused,
 	/* Register PEB memory regions */
 	hyperlight_init_mem(bi, g_peb);
 
+	/* Initialise the host-call subsystem so we can query the host */
+	hl_hcall_init(g_peb);
+
+	/* Try to get the command line from the host via hcall.
+	 * If the host doesn't register GetCmdLine, the default
+	 * "unikraft-hyperlight" stays in the buffer.
+	 */
+	{
+		int len = hl_call_get_cmdline(hyperlight_cmdline,
+					      sizeof(hyperlight_cmdline));
+		if (len < 0)
+			uk_pr_info("GetCmdLine: using default cmdline\n");
+		else
+			uk_pr_info("GetCmdLine: \"%s\"\n", hyperlight_cmdline);
+	}
+
 	/* Set boot protocol and command line */
 	memcpy(bi->bootprotocol, "hyperlight", sizeof("hyperlight"));
 	bi->cmdline = (__u64)hyperlight_cmdline;
-	bi->cmdline_len = sizeof(hyperlight_cmdline) - 1;
+	bi->cmdline_len = strlen(hyperlight_cmdline);
 
 	_ukplat_entry(bi);
 }
