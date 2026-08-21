@@ -49,6 +49,15 @@ int hl_hcall_ready(void);
 int hl_call_get_cmdline(char *out_buf, __sz buf_sz);
 
 /**
+ * Call GetPagingBudget() to query how many bytes the guest should
+ * allocate from scratch for the paging frame allocator.
+ *
+ * @return  Number of bytes (page-aligned), or 0 if the host function
+ *          is not registered (caller should compute a dynamic default).
+ */
+__u64 hl_call_get_paging_budget(void);
+
+/**
  * Call HostPrint — send a string to the host for printing.
  *
  * This calls the "HostPrint" host function with one string parameter.

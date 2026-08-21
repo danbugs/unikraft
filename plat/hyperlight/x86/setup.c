@@ -139,12 +139,10 @@ static void _ukplat_entry(struct ukplat_bootinfo *bi)
 	if (unlikely(rc))
 		UK_CRASH("Interrupt controller init failed: %d\n", rc);
 
-	/* Initialize memory */
-	rc = ukplat_mem_init();
-	if (unlikely(rc))
-		UK_CRASH("Mem init failed: %d\n", rc);
-
-	/* Allocate boot stack */
+	/* Allocate boot stack before ukplat_mem_init() — paging init
+	 * hands free regions to the frame allocator and clears their
+	 * permission flags, making them invisible to memregion_alloc.
+	 */
 	bstack = ukplat_memregion_alloc(__STACK_SIZE, UKPLAT_MEMRT_STACK,
 					UKPLAT_MEMRF_READ |
 					UKPLAT_MEMRF_WRITE);
@@ -168,6 +166,13 @@ static void _ukplat_entry(struct ukplat_bootinfo *bi)
 			*(volatile __u8 *)(p - i) = tmp;
 		}
 	}
+
+	/* Initialize memory — after boot stack is allocated, since
+	 * paging init consumes free regions for the frame allocator.
+	 */
+	rc = ukplat_mem_init();
+	if (unlikely(rc))
+		UK_CRASH("Mem init failed: %d\n", rc);
 
 	/* Switch away from the bootstrap stack */
 	uk_arch_x86_64_jump_to((__u64)bstack, (__u64)ukplat_entry2);

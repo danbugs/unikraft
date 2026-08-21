@@ -6,6 +6,7 @@ $(eval $(call addplatlib,hyperlight,libhyperlightplat))
 ##
 LIBHYPERLIGHTPLAT_ASINCLUDES-y += -I$(LIBHYPERLIGHTPLAT_BASE)/include
 LIBHYPERLIGHTPLAT_ASINCLUDES-y += -I$(UK_PLAT_COMMON_BASE)/include
+LIBHYPERLIGHTPLAT_CINCLUDES-y  += -I$(LIBHYPERLIGHTPLAT_BASE)/paging/include
 LIBHYPERLIGHTPLAT_CINCLUDES-y  += -I$(LIBHYPERLIGHTPLAT_BASE)/include
 LIBHYPERLIGHTPLAT_CINCLUDES-y  += -I$(UK_PLAT_COMMON_BASE)/include
 LIBHYPERLIGHTPLAT_CINCLUDES-y  += -I$(UK_PLAT_DRIVERS_BASE)/include
@@ -42,6 +43,17 @@ LIBHYPERLIGHTPLAT_SRCS-y += $(LIBHYPERLIGHTPLAT_BASE)/memory.c
 LIBHYPERLIGHTPLAT_SRCS-y += $(LIBHYPERLIGHTPLAT_BASE)/cow.c
 LIBHYPERLIGHTPLAT_SRCS-y += $(LIBHYPERLIGHTPLAT_BASE)/hcall.c
 LIBHYPERLIGHTPLAT_SRCS-$(CONFIG_ARCH_X86_64) += $(LIBHYPERLIGHTPLAT_BASE)/x86/time.c
+
+##
+## Override ukpaging's arch.h with Hyperlight-specific paging translation.
+## Library-specific CINCLUDES are searched before global CINCLUDES, so
+## plat/hyperlight/paging/include/uk/paging/arch.h is found before
+## lib/ukpaging/arch/x86_64/include/uk/paging/arch.h.
+##
+LIBUKPAGING_CINCLUDES-$(CONFIG_PLAT_HYPERLIGHT) += \
+	-I$(LIBHYPERLIGHTPLAT_BASE)/paging/include
+LIBUKPAGING_CINCLUDES-$(CONFIG_PLAT_HYPERLIGHT) += \
+	-I$(LIBHYPERLIGHTPLAT_BASE)/include
 
 ## Linker script (processed as a source for dependency tracking)
 LIBHYPERLIGHTPLAT_SRCS-y += $(UK_PLAT_HYPERLIGHT_DEF_LDS)

@@ -28,6 +28,7 @@
  */
 
 #include <string.h>
+#include <uk/assert.h>
 #include <uk/essentials.h>
 #include <uk/event.h>
 #include <uk/lcpu.h>
@@ -36,10 +37,14 @@
 
 #define HL_PAGE_SIZE	4096ULL
 
-/* Computed at init from scratch metadata */
-static __u64 cow_scratch_base_gpa;
-static __u64 cow_scratch_base_gva;
-static int   cow_initialized;
+/*
+ * Scratch region base addresses, computed at init from scratch metadata.
+ * Non-static so the paging arch layer can translate scratch GPAs to GVAs.
+ */
+__u64 hl_scratch_base_gpa;
+__u64 hl_scratch_base_gva;
+
+static int cow_initialized;
 
 /*
  * Convert a guest physical address (GPA) in the scratch region to
@@ -58,7 +63,7 @@ static int   cow_initialized;
  */
 static inline __u64 cow_phys_to_virt(__u64 gpa)
 {
-	return cow_scratch_base_gva + (gpa - cow_scratch_base_gpa);
+	return hl_scratch_base_gva + (gpa - hl_scratch_base_gpa);
 }
 
 static inline __u64 cow_read_cr3(void)
@@ -80,17 +85,32 @@ static inline void cow_write_pte(__u64 pte_phys, __u64 value)
 	*(volatile __u64 *)cow_phys_to_virt(pte_phys) = value;
 }
 
-/* Bump allocator: allocate n pages from scratch memory (atomic) */
-static __u64 cow_alloc_pages(__u64 n)
+/*
+ * Bump allocator: allocate n pages from scratch memory (atomic).
+ * Returns the GPA of the first page.  Aborts on scratch exhaustion
+ * (matches hyperlight-guest-bin behaviour).
+ *
+ * Two pages at the top of scratch are reserved for the exception
+ * stack and shared metadata — the allocator must not touch them.
+ */
+#define HL_SCRATCH_RESERVED_PAGES 2
+__u64 hl_scratch_alloc_pages(__u64 n)
 {
 	volatile __u64 *alloc_ptr = (volatile __u64 *)HL_SCRATCH_ALLOC_GVA;
 	__u64 nbytes = n * HL_PAGE_SIZE;
 	__u64 old;
+	__u64 max_avail = HL_MAX_GPA + 1 - HL_SCRATCH_RESERVED_PAGES * HL_PAGE_SIZE;
 
 	__asm__ volatile("lock xaddq %0, (%1)"
 			 : "=r"(old)
 			 : "r"(alloc_ptr), "0"(nbytes)
 			 : "memory");
+
+	if (old + nbytes > max_avail)
+		UK_CRASH("Out of scratch memory: need %lu bytes at %lx, max %lx\n",
+			 (unsigned long)nbytes, (unsigned long)old,
+			 (unsigned long)max_avail);
+
 	return old;
 }
 
@@ -146,7 +166,7 @@ static int cow_handle_fault(__u64 fault_addr, unsigned long error_code)
 		return 0;
 
 	/* Allocate, copy, remap */
-	new_gpa = cow_alloc_pages(1);
+	new_gpa = hl_scratch_alloc_pages(1);
 	new_gva = cow_phys_to_virt(new_gpa);
 	page_base = fault_addr & ~(HL_PAGE_SIZE - 1);
 	memcpy((void *)new_gva, (void *)page_base, HL_PAGE_SIZE);
@@ -205,7 +225,7 @@ void hyperlight_cow_init(void)
 	if (scratch_size == 0)
 		return;
 
-	cow_scratch_base_gpa = HL_MAX_GPA - scratch_size + 1;
-	cow_scratch_base_gva = HL_MAX_GVA - scratch_size + 1;
+	hl_scratch_base_gpa = HL_MAX_GPA - scratch_size + 1;
+	hl_scratch_base_gva = HL_MAX_GVA - scratch_size + 1;
 	cow_initialized = 1;
 }

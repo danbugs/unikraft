@@ -435,6 +435,57 @@ static int fb_decode_result_string(const __u8 *buf, __u64 buf_len,
 	return 0;
 }
 
+/*
+ * Decode a size-prefixed FunctionCallResult FlatBuffer and extract
+ * a u64 (ulong) return value.
+ *
+ * @param buf       FlatBuffer data (with 4-byte size prefix)
+ * @param buf_len   Length of buf
+ * @param out_val   Pointer to receive the u64 value
+ * @return          0 on success, -1 on error / function not found
+ */
+static int fb_decode_result_ulong(const __u8 *buf, __u64 buf_len,
+				  __u64 *out_val)
+{
+	if (buf_len < 8)
+		return -1;
+
+	__u64 root = 4 + fb_u32(buf, 4);
+
+	/* FunctionCallResult.result_type must be ReturnValueBox (1) */
+	__u8 result_type = fb_u8_default(buf, root, VT_FCR_RESULT_TYPE, 0);
+
+	if (result_type != HL_FCRT_RETURN_VALUE)
+		return -1;
+
+	/* Follow result → ReturnValueBox table */
+	__u64 rvb = fb_follow(buf, root, VT_FCR_RESULT);
+
+	if (rvb == 0)
+		return -1;
+
+	/* ReturnValueBox.value_type must be hlulong (4) */
+	__u8 value_type = fb_u8_default(buf, rvb, VT_RVB_VALUE_TYPE, 0);
+
+	if (value_type != HL_RV_HLULONG)
+		return -1;
+
+	/* Follow value → hlulong table */
+	__u64 hlu = fb_follow(buf, rvb, VT_RVB_VALUE);
+
+	if (hlu == 0)
+		return -1;
+
+	/* hlulong.value: u64 at VT offset 4 */
+	__u16 foff = fb_field(buf, hlu, VT_HLS_VALUE);
+
+	if (foff == 0)
+		return -1;
+
+	memcpy(out_val, buf + hlu + foff, sizeof(__u64));
+	return 0;
+}
+
 /* ── Public API ──────────────────────────────────────────────────── */
 
 int hl_call_get_cmdline(char *out_buf, __sz buf_sz)
@@ -493,6 +544,38 @@ int hl_call_get_cmdline(char *out_buf, __sz buf_sz)
 	memcpy(out_buf, str, str_len);
 	out_buf[str_len] = '\0';
 	return (int)str_len;
+}
+
+__u64 hl_call_get_paging_budget(void)
+{
+	__u8 fc_buf[256];
+	__u64 fc_len;
+	const __u8 *result_data;
+	__u64 result_len;
+	__u64 budget;
+
+	if (!g_hcall_ready)
+		return 0;
+
+	fc_len = fb_encode_function_call(fc_buf, sizeof(fc_buf),
+					 "GetPagingBudget",
+					 HL_FCT_HOST, HL_RT_ULONG);
+	if (fc_len == 0)
+		return 0;
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  fc_buf, fc_len) < 0)
+		return 0;
+
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+		return 0;
+
+	if (fb_decode_result_ulong(result_data, result_len, &budget) < 0)
+		return 0;
+
+	return budget;
 }
 
 int hl_call_host_print(const char *msg, __sz len)

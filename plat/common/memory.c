@@ -472,12 +472,12 @@ int ukplat_memregion_get(int i, struct ukplat_memregion_desc **mrd)
 }
 
 #ifdef CONFIG_LIBUKPAGING
-int ukplat_mem_init(void)
+int __attribute__((weak)) ukplat_mem_init(void)
 {
 	return uk_paging_init();
 }
 #else /* CONFIG_LIBUKPAGING */
-int ukplat_mem_init(void)
+int __attribute__((weak)) ukplat_mem_init(void)
 {
 	struct ukplat_bootinfo *bi = ukplat_bootinfo_get();
 	struct ukplat_memregion_desc *mrdp;

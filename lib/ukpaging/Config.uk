@@ -11,7 +11,7 @@ menuconfig LIBUKPAGING
 if LIBUKPAGING
 config LIBUKPAGING_DIRECTMAP
 	bool
-	default y if ARCH_ARM_64 || ARCH_X86_64
+	default y if (ARCH_ARM_64 || ARCH_X86_64) && !PLAT_HYPERLIGHT
 
 config LIBUKPAGING_5LEVEL
 	bool "Enable 5-level paging (EXPERIMENTAL)"

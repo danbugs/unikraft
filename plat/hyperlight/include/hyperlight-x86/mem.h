@@ -54,4 +54,28 @@
 #define HL_MAX_GPA	0x0000000FFFFFFFFFULL
 #define HL_MAX_GVA	HL_SCRATCH_TOP_GVA
 
+#if !__ASSEMBLY__
+#include <uk/arch/types.h>
+
+/*
+ * Scratch region base addresses (GPA and GVA).  Set by
+ * hyperlight_cow_init() at boot; used by the paging arch layer
+ * to translate between physical and virtual addresses.
+ *
+ * For GPAs in the scratch region:
+ *   GVA = hl_scratch_base_gva + (GPA - hl_scratch_base_gpa)
+ * For GPAs in the identity-mapped low region:
+ *   GVA = GPA
+ */
+extern __u64 hl_scratch_base_gpa;
+extern __u64 hl_scratch_base_gva;
+
+/*
+ * Bump allocator: allocate n contiguous pages from scratch memory.
+ * Returns the GPA of the first page.  Thread-safe (uses atomic xadd).
+ * Defined in cow.c.
+ */
+__u64 hl_scratch_alloc_pages(__u64 n);
+#endif /* !__ASSEMBLY__ */
+
 #endif /* __HYPERLIGHT_MEM_H__ */
