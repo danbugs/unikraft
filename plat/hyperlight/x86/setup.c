@@ -131,6 +131,33 @@ static void _ukplat_entry(struct ukplat_bootinfo *bi)
 		hyperlight_cow_init();
 	}
 
+#ifdef CONFIG_HAVE_SYSCALL
+	/*
+	 * Program SYSCALL MSRs so ring-3 apps (e.g. via elfloader's
+	 * execve) can transition to ring-0 via the syscall instruction.
+	 * Same setup as plat/kvm/x86/setup.c.
+	 */
+	{
+		extern void _ukplat_syscall(void);
+
+		uk_arch_x86_64_wrmsrl(UK_ARCH_X86_64_MSR_EFER,
+			uk_arch_x86_64_rdmsrl(UK_ARCH_X86_64_MSR_EFER) |
+			UK_ARCH_X86_64_EFER_LMA |
+			UK_ARCH_X86_64_EFER_LME |
+			UK_ARCH_X86_64_EFER_SCE);
+		uk_arch_x86_64_wrmsrl(UK_ARCH_X86_64_MSR_STAR,
+			(0x08ULL << 48) | (0x08ULL << 32));
+		uk_arch_x86_64_wrmsrl(UK_ARCH_X86_64_MSR_LSTAR,
+			(__uptr)_ukplat_syscall);
+		uk_arch_x86_64_wrmsrl(UK_ARCH_X86_64_MSR_SYSCALL_MASK,
+			UK_ARCH_X86_64_RFLAGS_TF |
+			UK_ARCH_X86_64_RFLAGS_DF |
+			UK_ARCH_X86_64_RFLAGS_IF |
+			UK_ARCH_X86_64_RFLAGS_AC |
+			UK_ARCH_X86_64_RFLAGS_NT);
+	}
+#endif /* CONFIG_HAVE_SYSCALL */
+
 	/* Execute early init */
 	uk_boot_early_init(bi);
 
