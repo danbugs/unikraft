@@ -10,11 +10,13 @@
 /*
  * Hyperlight's ELF loader assumes the last PT_LOAD segment has the
  * highest virtual address.  The default UK_SEGMENT_TLS_LOAD creates
- * an empty LOAD segment at the end that violates this assumption,
- * so we suppress it.
+ * a separate tls_load PT_LOAD segment at the end that violates this
+ * assumption.  Instead, load .tdata via the data PT_LOAD segment —
+ * it still gets a PT_TLS header for the TLS template metadata, but
+ * the actual content is loaded as part of the data segment.
  */
 #undef UK_SEGMENT_TLS_LOAD
-#define UK_SEGMENT_TLS_LOAD
+#define UK_SEGMENT_TLS_LOAD :data
 
 /*
  * Hyperlight loads guest code at BASE_ADDRESS (0x1000, defined in

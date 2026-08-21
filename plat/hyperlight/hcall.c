@@ -22,6 +22,7 @@
 
 #include <string.h>
 #include <uk/essentials.h>
+#include <uk/plat/spinlock.h>
 #include <uk/print.h>
 
 #include <hyperlight-x86/hcall.h>
@@ -35,6 +36,23 @@ static __u64 g_input_stack_size;
 static volatile __u8 *g_output_stack;
 static __u64 g_output_stack_size;
 static int g_hcall_ready;
+
+/*
+ * Serialise host calls.  The PEB I/O stacks are global, single-instance
+ * buffers with no built-in synchronisation.  If the scheduler preempts
+ * a thread between push and pop (e.g. on a timer tick), another thread
+ * could start its own push → outb → pop sequence on the same stacks,
+ * corrupting the in-flight call.
+ *
+ * We use irqsave/irqrestore to disable interrupts (prevents preemption
+ * on our single vCPU) plus a spinlock (compiler barrier; also correct
+ * if SMP is ever enabled).
+ *
+ * TODO: This may become unnecessary once Hyperlight switches to
+ * virtqueue-based host-guest communication (hyperlight-dev/hyperlight
+ * PR #1717), which replaces the PEB I/O stacks entirely.
+ */
+static __spinlock g_hcall_lock = UKARCH_SPINLOCK_INITIALIZER();
 
 void hl_hcall_init(const struct hyperlight_peb *peb)
 {
@@ -496,13 +514,15 @@ int hl_call_get_cmdline(char *out_buf, __sz buf_sz)
 	__u64 result_len;
 	const char *str;
 	__u64 str_len;
+	unsigned long irqf;
+	int rc = -1;
 
 	if (!g_output_stack || !g_input_stack) {
 		uk_pr_err("hcall: not initialised\n");
 		return -1;
 	}
 
-	/* Encode the FunctionCall */
+	/* Encode the FunctionCall (no shared state — outside lock) */
 	fc_len = fb_encode_function_call(fc_buf, sizeof(fc_buf),
 					 "GetCmdLine",
 					 HL_FCT_HOST, HL_RT_STRING);
@@ -511,39 +531,36 @@ int hl_call_get_cmdline(char *out_buf, __sz buf_sz)
 		return -1;
 	}
 
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
 	/* Push onto output stack */
 	if (hl_stack_push(g_output_stack, g_output_stack_size,
-			  fc_buf, fc_len) < 0) {
-		uk_pr_err("hcall: output stack full\n");
-		return -1;
-	}
+			  fc_buf, fc_len) < 0)
+		goto out;
 
 	/* Trigger host dispatch — port 101 = CallFunction */
 	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
 
 	/* Pop result from input stack */
-	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0) {
-		uk_pr_err("hcall: no result on input stack\n");
-		return -1;
-	}
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+		goto out;
 
 	/* Decode the string result */
 	if (fb_decode_result_string(result_data, result_len,
-				    &str, &str_len) < 0) {
-		uk_pr_err("hcall: failed to decode GetCmdLine result\n");
-		return -1;
-	}
+				    &str, &str_len) < 0)
+		goto out;
 
 	/* Copy to caller's buffer */
-	if (str_len >= buf_sz) {
-		uk_pr_err("hcall: cmdline too long (%lu >= %lu)\n",
-			  (unsigned long)str_len, (unsigned long)buf_sz);
-		return -1;
-	}
+	if (str_len >= buf_sz)
+		goto out;
 
 	memcpy(out_buf, str, str_len);
 	out_buf[str_len] = '\0';
-	return (int)str_len;
+	rc = (int)str_len;
+
+out:
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return rc;
 }
 
 __u64 hl_call_get_paging_budget(void)
@@ -553,6 +570,7 @@ __u64 hl_call_get_paging_budget(void)
 	const __u8 *result_data;
 	__u64 result_len;
 	__u64 budget;
+	unsigned long irqf;
 
 	if (!g_hcall_ready)
 		return 0;
@@ -563,18 +581,27 @@ __u64 hl_call_get_paging_budget(void)
 	if (fc_len == 0)
 		return 0;
 
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
 	if (hl_stack_push(g_output_stack, g_output_stack_size,
-			  fc_buf, fc_len) < 0)
+			  fc_buf, fc_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
 	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
 
-	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
-	if (fb_decode_result_ulong(result_data, result_len, &budget) < 0)
+	if (fb_decode_result_ulong(result_data, result_len, &budget) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 	return budget;
 }
 
@@ -585,6 +612,7 @@ __u64 hl_call_get_initrd_base(void)
 	const __u8 *result_data;
 	__u64 result_len;
 	__u64 base;
+	unsigned long irqf;
 
 	if (!g_hcall_ready)
 		return 0;
@@ -595,18 +623,27 @@ __u64 hl_call_get_initrd_base(void)
 	if (fc_len == 0)
 		return 0;
 
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
 	if (hl_stack_push(g_output_stack, g_output_stack_size,
-			  fc_buf, fc_len) < 0)
+			  fc_buf, fc_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
 	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
 
-	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
-	if (fb_decode_result_ulong(result_data, result_len, &base) < 0)
+	if (fb_decode_result_ulong(result_data, result_len, &base) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 	return base;
 }
 
@@ -617,6 +654,7 @@ __u64 hl_call_get_initrd_size(void)
 	const __u8 *result_data;
 	__u64 result_len;
 	__u64 size;
+	unsigned long irqf;
 
 	if (!g_hcall_ready)
 		return 0;
@@ -627,18 +665,27 @@ __u64 hl_call_get_initrd_size(void)
 	if (fc_len == 0)
 		return 0;
 
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
 	if (hl_stack_push(g_output_stack, g_output_stack_size,
-			  fc_buf, fc_len) < 0)
+			  fc_buf, fc_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
 	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
 
-	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
-	if (fb_decode_result_ulong(result_data, result_len, &size) < 0)
+	if (fb_decode_result_ulong(result_data, result_len, &size) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return 0;
+	}
 
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 	return size;
 }
 
@@ -654,6 +701,7 @@ int hl_call_host_print(const char *msg, __sz len)
 	__u64 fc_len;
 	const __u8 *result_data;
 	__u64 result_len;
+	unsigned long irqf;
 
 	if (!g_hcall_ready)
 		return -1;
@@ -661,6 +709,7 @@ int hl_call_host_print(const char *msg, __sz len)
 	if (len > 4096)
 		len = 4096;
 
+	/* Encode outside the lock — no shared state touched */
 	fc_len = fb_encode_function_call_1str(
 		fc_buf, sizeof(fc_buf),
 		"HostPrint", 9,
@@ -669,14 +718,19 @@ int hl_call_host_print(const char *msg, __sz len)
 	if (fc_len == 0)
 		return -1;
 
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
 	if (hl_stack_push(g_output_stack, g_output_stack_size,
-			  fc_buf, fc_len) < 0)
+			  fc_buf, fc_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 		return -1;
+	}
 
 	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
 
 	/* Pop and discard the return value (i32 result code) */
 	hl_stack_pop(g_input_stack, &result_data, &result_len);
 
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 	return 0;
 }
