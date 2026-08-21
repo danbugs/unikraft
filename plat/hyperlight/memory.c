@@ -188,6 +188,30 @@ int ukplat_mem_init(void)
 	if (unlikely(rc))
 		return rc;
 
+	/*
+	 * If the host mapped an initrd via map_file_cow, create
+	 * first-stage page table entries for it.  The EPT already
+	 * covers these GPAs (the host set that up), but the guest's
+	 * CR3 page tables don't — they only cover the snapshot and
+	 * scratch regions.  We identity-map the initrd so VA = GPA.
+	 */
+	ukplat_memregion_foreach(&mrd, UKPLAT_MEMRT_INITRD, 0, 0) {
+		unsigned long pages = mrd->pg_count;
+
+		rc = uk_paging_page_map(&hyperlight_pt,
+					mrd->vbase, mrd->pbase, pages,
+					UK_PAGING_PAGE_ATTR_PROT_READ, 0);
+		if (unlikely(rc)) {
+			uk_pr_err("Failed to map initrd at %lx: %d\n",
+				  (unsigned long)mrd->vbase, rc);
+			return rc;
+		}
+
+		uk_pr_info("Mapped initrd: %lu pages at VA %lx → GPA %lx\n",
+			   pages, (unsigned long)mrd->vbase,
+			   (unsigned long)mrd->pbase);
+	}
+
 	return 0;
 }
 

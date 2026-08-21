@@ -221,6 +221,43 @@ void hyperlight_entry(struct uk_lcpu *lcpu __unused,
 			uk_pr_info("GetCmdLine: \"%s\"\n", hyperlight_cmdline);
 	}
 
+	/* Query the host for a mapped initrd and register it.
+	 * The host decides where to map the initrd (via map_file_cow)
+	 * and tells us via GetInitrdBase/GetInitrdSize.
+	 */
+	{
+		__u64 initrd_base = hl_call_get_initrd_base();
+		__u64 initrd_size = hl_call_get_initrd_size();
+
+		/*
+			 * TODO: consider crashing when exactly one of
+			 * base/size is zero — that likely indicates a
+			 * misconfigured host rather than "no initrd".
+			 */
+			if (initrd_base > 0 && initrd_size > 0) {
+			struct ukplat_memregion_desc mrd = {0};
+			int rc;
+
+			mrd.pbase = initrd_base;
+			mrd.vbase = initrd_base; /* identity-mapped */
+			mrd.pg_off = 0;
+			mrd.len = initrd_size;
+			mrd.pg_count = (initrd_size + __PAGE_SIZE - 1) / __PAGE_SIZE;
+			mrd.type = UKPLAT_MEMRT_INITRD;
+			mrd.flags = UKPLAT_MEMRF_READ;
+#ifdef CONFIG_UKPLAT_MEMRNAME
+			memcpy(mrd.name, "initrd", sizeof("initrd"));
+#endif
+			rc = ukplat_memregion_list_insert(&bi->mrds, &mrd);
+			if (unlikely(rc < 0))
+				UK_CRASH("Unable to add initrd region\n");
+
+			uk_pr_info("Initrd: %lu bytes at GPA %lx\n",
+				   (unsigned long)initrd_size,
+				   (unsigned long)initrd_base);
+		}
+	}
+
 	/* Set boot protocol and command line */
 	memcpy(bi->bootprotocol, "hyperlight", sizeof("hyperlight"));
 	bi->cmdline = (__u64)hyperlight_cmdline;

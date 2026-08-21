@@ -58,6 +58,21 @@ int hl_call_get_cmdline(char *out_buf, __sz buf_sz);
 __u64 hl_call_get_paging_budget(void);
 
 /**
+ * Call GetInitrdBase() to query the GPA where the host mapped the
+ * initrd via map_file_cow.
+ *
+ * @return  GPA of the initrd, or 0 if no initrd is mapped.
+ */
+__u64 hl_call_get_initrd_base(void);
+
+/**
+ * Call GetInitrdSize() to query the size of the mapped initrd.
+ *
+ * @return  Size in bytes, or 0 if no initrd is mapped.
+ */
+__u64 hl_call_get_initrd_size(void);
+
+/**
  * Call HostPrint — send a string to the host for printing.
  *
  * This calls the "HostPrint" host function with one string parameter.

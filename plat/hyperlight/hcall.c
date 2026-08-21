@@ -578,6 +578,70 @@ __u64 hl_call_get_paging_budget(void)
 	return budget;
 }
 
+__u64 hl_call_get_initrd_base(void)
+{
+	__u8 fc_buf[256];
+	__u64 fc_len;
+	const __u8 *result_data;
+	__u64 result_len;
+	__u64 base;
+
+	if (!g_hcall_ready)
+		return 0;
+
+	fc_len = fb_encode_function_call(fc_buf, sizeof(fc_buf),
+					 "GetInitrdBase",
+					 HL_FCT_HOST, HL_RT_ULONG);
+	if (fc_len == 0)
+		return 0;
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  fc_buf, fc_len) < 0)
+		return 0;
+
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+		return 0;
+
+	if (fb_decode_result_ulong(result_data, result_len, &base) < 0)
+		return 0;
+
+	return base;
+}
+
+__u64 hl_call_get_initrd_size(void)
+{
+	__u8 fc_buf[256];
+	__u64 fc_len;
+	const __u8 *result_data;
+	__u64 result_len;
+	__u64 size;
+
+	if (!g_hcall_ready)
+		return 0;
+
+	fc_len = fb_encode_function_call(fc_buf, sizeof(fc_buf),
+					 "GetInitrdSize",
+					 HL_FCT_HOST, HL_RT_ULONG);
+	if (fc_len == 0)
+		return 0;
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  fc_buf, fc_len) < 0)
+		return 0;
+
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+		return 0;
+
+	if (fb_decode_result_ulong(result_data, result_len, &size) < 0)
+		return 0;
+
+	return size;
+}
+
 int hl_call_host_print(const char *msg, __sz len)
 {
 	/*
