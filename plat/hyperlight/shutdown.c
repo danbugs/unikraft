@@ -11,13 +11,9 @@
  * The host intercepts this VM exit to know the guest has finished
  * initialisation and is ready to receive function calls.
  *
- * For a guest that simply exits (no dispatch loop), the dispatch
- * address is 0 — the host sees this as "no dispatch entry point"
- * and tears down the VM.
- *
- * TODO: Once the FlatBuffer dispatch infrastructure is in place,
- * pass the real dispatch function address so the host can invoke
- * guest functions after init.
+ * RAX holds the address of hyperlight_dispatch_function — the host
+ * captures this during evolve() and uses it as the RIP for subsequent
+ * guest function calls via MultiUseSandbox::call().
  */
 
 #include <uk/boot/earlytab.h>
@@ -27,23 +23,28 @@
 
 #include <hyperlight-x86/outb.h>
 
+/* Provided by dispatch.c */
+extern void hyperlight_dispatch_function(void)
+	__attribute__((noreturn));
+
 static int hyperlight_shutdown(void)
 {
 	/*
 	 * Halt via port 108.  The host intercepts this VM exit.
-	 * EAX = dispatch function address (0 = no dispatch).
+	 * RAX = dispatch function address — the host stores this
+	 * and sets RIP here for each call() after evolve().
 	 * cli + hlt after outl is a backstop — the VM exit from
 	 * outl already stops the vCPU.
 	 */
 	__asm__ volatile(
 		/* Hyperlight checks RSP alignment after halt */
 		"andq $~0xf, %%rsp\n\t"
-		"xorl %%eax, %%eax\n\t"
+		"movq %0, %%rax\n\t"
 		"movw $108, %%dx\n\t"
 		"outl %%eax, %%dx\n\t"
 		"cli\n\t"
 		"hlt\n\t"
-		: : : "rax", "rdx"
+		: : "r"((__u64)hyperlight_dispatch_function) : "rax", "rdx"
 	);
 	__builtin_unreachable();
 }

@@ -31,6 +31,7 @@
 #include <uk/plat/common/sections.h>
 #include <uk/plat/common/bootinfo.h>
 
+#include <hyperlight-x86/dispatch.h>
 #include <hyperlight-x86/hcall.h>
 #include <hyperlight-x86/peb.h>
 #include <hyperlight-x86/setup.h>
@@ -234,6 +235,12 @@ void hyperlight_entry(struct uk_lcpu *lcpu __unused,
 
 	/* Initialise the host-call subsystem so we can query the host */
 	hl_hcall_init(g_peb);
+
+	/* Initialise the dispatch subsystem with a copy of the PEB.
+	 * The dispatch handler reads/writes the PEB I/O stacks when
+	 * the host calls guest functions after evolve().
+	 */
+	hyperlight_dispatch_init(g_peb);
 
 	/* Try to get the command line from the host via hcall.
 	 * If the host doesn't register GetCmdLine, the default
