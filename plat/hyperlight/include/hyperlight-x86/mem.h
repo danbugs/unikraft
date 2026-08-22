@@ -76,6 +76,16 @@ extern __u64 hl_scratch_base_gva;
  * Defined in cow.c.
  */
 __u64 hl_scratch_alloc_pages(__u64 n);
+
+/*
+ * Boot-time CoW page fault handler (entry64.S).
+ *
+ * Self-contained assembly that resolves CoW faults by walking page
+ * tables in scratch, bump-allocating a fresh page, copying content,
+ * and remapping as writable.  Uses IST=0 (current stack) and has
+ * no BSS dependencies — safe to use while BSS pages are still CoW.
+ */
+void _cow_asm_pf_handler(void);
 #endif /* !__ASSEMBLY__ */
 
 #endif /* __HYPERLIGHT_MEM_H__ */
