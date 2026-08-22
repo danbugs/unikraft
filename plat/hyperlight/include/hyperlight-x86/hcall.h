@@ -39,6 +39,28 @@ void hl_hcall_init(const struct hyperlight_peb *peb);
 int hl_hcall_ready(void);
 
 /**
+ * Low-level PEB I/O stack push/pop.
+ *
+ * Shared by the hcall subsystem (guest→host calls) and the dispatch
+ * subsystem (host→guest calls).  Both operate on the same PEB I/O
+ * stacks using the same blob-stack layout.
+ */
+int hl_stack_push(volatile __u8 *stack, __u64 stack_size,
+		  const __u8 *data, __u64 data_len);
+int hl_stack_pop(volatile __u8 *stack,
+		 const __u8 **out_data, __u64 *out_len);
+
+/**
+ * Call GetExnStackTop() to query the scratch exception stack top GVA.
+ *
+ * The host reads the value from hyperlight-common so the guest does
+ * not need to hardcode layout constants.
+ *
+ * @return  Exception stack top GVA, or 0 on failure.
+ */
+__u64 hl_call_get_exn_stack_top(void);
+
+/**
  * Call the GetCmdLine host function to retrieve the command line.
  *
  * @param out_buf   Buffer to receive the null-terminated string
