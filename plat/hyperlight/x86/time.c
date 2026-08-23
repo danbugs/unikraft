@@ -17,9 +17,9 @@
  * which provides pre-computed scaling factors via a clock page,
  * eliminating the need for frequency guessing entirely.
  *
- * TODO: Get wall-clock epoch from the host via a host function
- * call so the guest can report real timestamps.  Currently, wall
- * time equals monotonic time (epoch = guest boot).
+ * Wall-clock epoch is obtained from the host via GetWallClockNs at
+ * boot so the guest can report real timestamps.  If the host does
+ * not register the function, wall time falls back to monotonic.
  */
 
 #include <uk/arch/x86_64.h>
@@ -29,9 +29,14 @@
 #include <uk/plat/time.h>
 #include <uk/print.h>
 
+#include <hyperlight-x86/hcall.h>
+
 /* TSC state */
 static __u64 tsc_freq;	/* Hz */
 static __u64 tsc_start;
+
+/* Wall-clock epoch: ns since Unix epoch at boot, from host */
+static __u64 wall_clock_boot_ns;
 
 /* Used by lib/ukintctlr to signal pending events to the scheduler */
 unsigned long sched_have_pending_events;
@@ -120,16 +125,24 @@ __nsec ukplat_monotonic_clock(void)
 	     + (rem * UKARCH_NSEC_PER_SEC) / tsc_freq;
 }
 
-/* No wall-clock source — returns monotonic (see header TODOs). */
 __nsec ukplat_wall_clock(void)
 {
-	return ukplat_monotonic_clock();
+	return wall_clock_boot_ns + ukplat_monotonic_clock();
 }
 
 void ukplat_time_init(void)
 {
 	tsc_start = uk_arch_x86_64_rdtsc();
 	discover_tsc_freq();
+
+	/* Query the host for the current wall-clock time.
+	 * If the host doesn't register GetWallClockNs, we get 0 and
+	 * wall time falls back to monotonic (epoch = guest boot).
+	 */
+	wall_clock_boot_ns = hl_call_get_wall_clock_ns();
+	if (wall_clock_boot_ns)
+		uk_pr_info("Wall clock epoch: %llu ns\n",
+			   (unsigned long long)wall_clock_boot_ns);
 }
 
 void ukplat_time_fini(void)

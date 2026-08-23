@@ -776,3 +776,45 @@ __u64 hl_call_get_exn_stack_top(void)
 	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 	return val;
 }
+
+__u64 hl_call_get_wall_clock_ns(void)
+{
+	__u8 fc_buf[256];
+	__u64 fc_len;
+	const __u8 *result_data;
+	__u64 result_len;
+	__u64 val;
+	unsigned long irqf;
+
+	if (!g_hcall_ready)
+		return 0;
+
+	fc_len = fb_encode_function_call(fc_buf, sizeof(fc_buf),
+					 "GetWallClockNs",
+					 HL_FCT_HOST, HL_RT_ULONG);
+	if (fc_len == 0)
+		return 0;
+
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  fc_buf, fc_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+		return 0;
+	}
+
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+		return 0;
+	}
+
+	if (fb_decode_result_ulong(result_data, result_len, &val) < 0) {
+		ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+		return 0;
+	}
+
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return val;
+}

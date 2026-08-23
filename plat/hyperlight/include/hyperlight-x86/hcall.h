@@ -95,6 +95,14 @@ __u64 hl_call_get_initrd_base(void);
 __u64 hl_call_get_initrd_size(void);
 
 /**
+ * Call GetWallClockNs() to query the host's wall-clock time.
+ *
+ * @return  Nanoseconds since the Unix epoch, or 0 if the host function
+ *          is not registered (wall clock will fall back to monotonic).
+ */
+__u64 hl_call_get_wall_clock_ns(void);
+
+/**
  * Call HostPrint — send a string to the host for printing.
  *
  * This calls the "HostPrint" host function with one string parameter.

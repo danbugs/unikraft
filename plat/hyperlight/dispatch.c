@@ -148,15 +148,19 @@ void __attribute__((used))
 hyperlight_dispatch_inner(void)
 {
 	/*
-	 * Local buffer for the FunctionCall FlatBuffer.
+	 * Buffer for the FunctionCall FlatBuffer.
 	 *
 	 * The pop returns a pointer into the input stack.  Any subsequent
 	 * host function call (including uk_pr_err via HostPrint) pushes a
 	 * response onto the SAME input stack at the same offset, clobbering
 	 * the data.  We must copy it out before doing anything that might
 	 * trigger a host call.
+	 *
+	 * Static because dispatch is single-threaded (one vCPU) and the
+	 * dispatch entry runs on the exception stack, which is too small
+	 * for a 16 KiB stack allocation.
 	 */
-	__u8 fc_buf[4096];
+	static __u8 fc_buf[16384];
 	const __u8 *fc_raw;
 	__u64 fc_len;
 
