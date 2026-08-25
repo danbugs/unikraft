@@ -396,6 +396,14 @@ hyperlight_dispatch_function(void)
 		 */
 		"callq hyperlight_dispatch_fixup_syscall\n\t"
 
+		/*
+		 * Re-initialise the paging frame allocator.
+		 * The FA lives entirely in scratch, which was zeroed on
+		 * restore.  Without this, demand paging (mmap, stack
+		 * growth) crashes on NULL FA function pointers.
+		 */
+		"callq hyperlight_paging_reinit\n\t"
+
 		"1:\n\t"
 		/* ── Normal dispatch ───────────────────────────── */
 		"callq hyperlight_dispatch_inner\n\t"

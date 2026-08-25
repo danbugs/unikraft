@@ -86,6 +86,15 @@ __u64 hl_scratch_alloc_pages(__u64 n);
  * no BSS dependencies — safe to use while BSS pages are still CoW.
  */
 void _cow_asm_pf_handler(void);
+
+/*
+ * Re-initialise the paging frame allocator after snapshot restore.
+ *
+ * Called from hyperlight_dispatch_function's snapshot fixup path.
+ * On non-restore dispatches (FA still valid) this returns immediately.
+ * Defined in memory.c (CONFIG_LIBUKPAGING); no-op stub otherwise.
+ */
+void hyperlight_paging_reinit(void);
 #endif /* !__ASSEMBLY__ */
 
 #endif /* __HYPERLIGHT_MEM_H__ */

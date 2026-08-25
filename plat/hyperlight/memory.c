@@ -47,11 +47,17 @@ int ukplat_mem_init(void)
 	return 0;
 }
 
+void hyperlight_paging_reinit(void)
+{
+	/* No frame allocator to reinit without paging. */
+}
+
 #else /* CONFIG_LIBUKPAGING */
 
 #include <uk/arch/limits.h>
 #include <uk/assert.h>
 #include <uk/essentials.h>
+#include <uk/fallocbuddy.h>
 #include <uk/paging.h>
 #include <uk/paging/arch.h>
 #include <uk/plat/memory.h>
@@ -213,6 +219,99 @@ int ukplat_mem_init(void)
 	}
 
 	return 0;
+}
+
+/*
+ * Re-initialise the paging frame allocator after snapshot restore.
+ *
+ * The frame allocator (FA) struct, zone metadata, bitmaps, and free-list
+ * entries all live in scratch memory — allocated there by ukplat_mem_init
+ * during the initial boot (evolve).  Snapshot/restore zeroes scratch
+ * (only the rebuilt page tables are copied back), so every byte of FA
+ * state is lost.
+ *
+ * Without re-initialisation, the first demand fault after restore
+ * (e.g. a new mmap page, stack growth) calls through the FA's NULL
+ * function pointers and crashes.
+ *
+ * This function also fixes hyperlight_pt.pt_pbase / pt_vbase: after
+ * restore the host sets CR3 to the relocated page tables in scratch,
+ * but the snapshot copy of hyperlight_pt still holds the evolve-time
+ * values.
+ *
+ * Called from hyperlight_dispatch_function's snapshot fixup path,
+ * after pre-faulting .data/.bss and restoring the kernel IDT.
+ *
+ * On non-restore dispatches the check (fa->falloc != NULL) returns
+ * immediately — cost is a single pointer dereference.
+ */
+void hyperlight_paging_reinit(void)
+{
+	__paddr_t cr3;
+	__sz fa_size, fa_struct_size;
+	__u64 fa_pages, bump_pos, max_avail, available;
+	__paddr_t scratch_block;
+	int rc;
+
+	/* Fix pt_pbase / pt_vbase to match the current CR3. */
+	cr3 = read_cr3();
+	hyperlight_pt.pt_pbase = cr3;
+	hyperlight_pt.pt_vbase = pgarch_directmap_paddr_to_vaddr(cr3);
+
+	/* Fast path: if the FA is intact this is a normal (non-restore)
+	 * dispatch — nothing else to do.
+	 */
+	if (hyperlight_pt.fa && hyperlight_pt.fa->falloc)
+		return;
+
+	/* Compute remaining scratch dynamically.  The host-provided
+	 * GetPagingBudget was set at evolve time and does not account
+	 * for scratch consumed by the PT copy and CoW pre-fault, so
+	 * we always use the bump-pointer calculation here.
+	 */
+	bump_pos = *(volatile __u64 *)HL_SCRATCH_ALLOC_GVA;
+	max_avail = HL_MAX_GPA + 1 - 2 * __PAGE_SIZE;
+	if (bump_pos >= max_avail)
+		return;
+
+	available = max_avail - bump_pos;
+	fa_size = (__sz)((available * 3 / 4) & ~((__u64)__PAGE_SIZE - 1));
+
+	if (fa_size < 16 * __PAGE_SIZE) {
+		uk_pr_warn("paging reinit: not enough scratch (%lu bytes)\n",
+			   (unsigned long)fa_size);
+		return;
+	}
+
+	fa_pages = fa_size / __PAGE_SIZE;
+	scratch_block = hl_scratch_alloc_pages(fa_pages);
+
+	/* Place the FA struct at the start of the scratch block and
+	 * add the remainder as allocatable frames — same layout as
+	 * pgarch_pt_init(), but without re-creating a PML4.
+	 */
+	hyperlight_pt.fa = (struct uk_falloc *)
+		pgarch_directmap_paddr_to_vaddr(scratch_block);
+
+	fa_struct_size = ALIGN_UP(uk_fallocbuddy_size(), 8);
+
+	rc = uk_fallocbuddy_init(hyperlight_pt.fa);
+	if (unlikely(rc)) {
+		uk_pr_warn("paging reinit: fallocbuddy_init failed: %d\n", rc);
+		return;
+	}
+
+	rc = uk_paging_pt_add_mem(&hyperlight_pt,
+				  scratch_block + fa_struct_size,
+				  fa_size - fa_struct_size);
+	if (unlikely(rc)) {
+		uk_pr_warn("paging reinit: add_mem failed: %d\n", rc);
+		return;
+	}
+
+	uk_pr_info("Paging reinit: %lu KiB from scratch GPA %lx\n",
+		   (unsigned long)(fa_size >> 10),
+		   (unsigned long)scratch_block);
 }
 
 #endif /* CONFIG_LIBUKPAGING */
