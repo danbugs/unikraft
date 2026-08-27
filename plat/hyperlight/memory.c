@@ -239,11 +239,10 @@ int ukplat_mem_init(void)
  * but the snapshot copy of hyperlight_pt still holds the evolve-time
  * values.
  *
- * Called from hyperlight_dispatch_function's snapshot fixup path,
- * after pre-faulting .data/.bss and restoring the kernel IDT.
- *
- * On non-restore dispatches the check (fa->falloc != NULL) returns
- * immediately — cost is a single pointer dereference.
+ * Called ONLY from hyperlight_dispatch_function's snapshot fixup path
+ * (ZF=1 dispatch), after pre-faulting .data/.bss and restoring the
+ * kernel IDT.  This means every call follows a snapshot restore, so
+ * we always perform the full reinit unconditionally.
  */
 void hyperlight_paging_reinit(void)
 {
@@ -257,12 +256,6 @@ void hyperlight_paging_reinit(void)
 	cr3 = read_cr3();
 	hyperlight_pt.pt_pbase = cr3;
 	hyperlight_pt.pt_vbase = pgarch_directmap_paddr_to_vaddr(cr3);
-
-	/* Fast path: if the FA is intact this is a normal (non-restore)
-	 * dispatch — nothing else to do.
-	 */
-	if (hyperlight_pt.fa && hyperlight_pt.fa->falloc)
-		return;
 
 	/* Compute remaining scratch dynamically.  The host-provided
 	 * GetPagingBudget was set at evolve time and does not account
