@@ -58,7 +58,7 @@ __u64 g_exn_stack_top;
 
 /* ── Callback registration ─────────────────────────────────────── */
 
-typedef void (*hl_dispatch_fn_t)(const __u8 *fc, __u64 fc_len);
+typedef int (*hl_dispatch_fn_t)(const __u8 *fc, __u64 fc_len);
 static volatile hl_dispatch_fn_t g_dispatch_callback;
 
 /* Pointer/length of the current FunctionCall — set before the
@@ -142,6 +142,46 @@ void hyperlight_dispatch_init(const struct hyperlight_peb *peb)
 	g_dispatch_ready = 1;
 }
 
+/* ── Abort helper ──────────────────────────────────────────────── */
+
+/*
+ * Signal a dispatch error to the host via the Abort port (102).
+ *
+ * The abort protocol sends bytes in chunks of up to 3 per outb:
+ *   u32 LE = [chunk_len, b1, b2, b3]
+ * Byte sequence: [error_code, message..., 0xFF terminator].
+ *
+ * The host accumulates bytes until the 0xFF terminator, then returns
+ * GuestAborted to the caller of sandbox.call().  On the next call()
+ * the host resets RIP to hyperlight_dispatch_function, so the guest
+ * resumes fresh.
+ */
+static void dispatch_send_abort(const char *msg)
+{
+	__u8 data[128];
+	__sz len = 0;
+
+	data[len++] = 1; /* error code: generic dispatch error */
+
+	while (*msg && len < sizeof(data) - 1)
+		data[len++] = (__u8)*msg++;
+
+	data[len++] = 0xFF; /* terminator */
+
+	/* Send in chunks of 3 bytes via port 102. */
+	__sz i = 0;
+	while (i < len) {
+		__sz remaining = len - i;
+		__sz chunk_len = remaining < 3 ? remaining : 3;
+		__u32 val = (__u32)chunk_len;
+		__sz j;
+		for (j = 0; j < chunk_len; j++)
+			val |= (__u32)data[i + j] << (8 * (j + 1));
+		hyperlight_out32(HYPERLIGHT_PORT_ABORT, val);
+		i += chunk_len;
+	}
+}
+
 /* ── Dispatch inner ─────────────────────────────────────────────── */
 
 void __attribute__((used))
@@ -190,14 +230,26 @@ hyperlight_dispatch_inner(void)
 	g_fc_len = fc_len;
 
 	if (g_dispatch_callback) {
-		g_dispatch_callback(fc_buf, fc_len);
-	} else {
-		uk_pr_err("dispatch: no callback registered (fc_len=%lu)\n",
-			  (unsigned long)fc_len);
-	}
+		int dispatch_rc = g_dispatch_callback(fc_buf, fc_len);
 
-	g_fc_bytes = NULL;
-	g_fc_len = 0;
+		g_fc_bytes = NULL;
+		g_fc_len = 0;
+
+		if (dispatch_rc != 0) {
+			/*
+			 * Abort the VM so the host's run() returns
+			 * Err(GuestAborted).  The host resets RIP on
+			 * the next call(), so the guest resumes fresh.
+			 */
+			dispatch_send_abort("dispatch callback failed");
+			return;
+		}
+	} else {
+		g_fc_bytes = NULL;
+		g_fc_len = 0;
+		uk_pr_warn("dispatch: no callback registered (fc_len=%lu)\n",
+			   (unsigned long)fc_len);
+	}
 
 push_result:
 	hl_stack_push(g_output_stack, g_output_stack_size,
