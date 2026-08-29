@@ -151,10 +151,95 @@ int hl_call_host_print(const char *msg, __sz len);
 #define HL_RV_HLVOID	9
 
 /*
+ * FlatBuffer ParameterValue union discriminants.
+ */
+#define HL_PV_HLINT	1
+#define HL_PV_HLUINT	2
+#define HL_PV_HLLONG	3
+#define HL_PV_HLULONG	4
+#define HL_PV_HLFLOAT	5
+#define HL_PV_HLDOUBLE	6
+#define HL_PV_HLSTRING	7
+#define HL_PV_HLBOOL	8
+#define HL_PV_HLVECBYTES 9
+
+/*
+ * Additional ReturnType / ReturnValue constants not in original set.
+ */
+#define HL_RT_VECBYTES		9	/* ReturnType for Vec<u8> */
+#define HL_RV_HLSIZEPREFIXED	10	/* ReturnValue discriminant for Vec<u8> */
+
+/*
  * FlatBuffer FunctionCallResultType discriminants.
  */
 #define HL_FCRT_NONE		0
 #define HL_FCRT_RETURN_VALUE	1
 #define HL_FCRT_GUEST_ERROR	2
+
+/* ── Generic host function call API ──────────────────────────────── */
+
+/**
+ * Maximum parameters per host function call.
+ */
+#define HL_MAX_PARAMS	11
+
+/**
+ * Typed parameter for generic host function calls.
+ */
+struct hl_param {
+	__u8 type;		/* HL_PV_* discriminant */
+	union {
+		__s32 i32_val;
+		__u32 u32_val;
+		__s64 i64_val;
+		__u64 u64_val;
+		struct { const char *ptr; __u32 len; } str;
+		struct { const __u8 *ptr; __u32 len; } vec;
+	};
+};
+
+/**
+ * Call a host function returning i32.
+ *
+ * @param func_name  Host function name
+ * @param params     Array of typed parameters
+ * @param nparams    Number of parameters (0..HL_MAX_PARAMS)
+ * @param out        Output: the i32 return value
+ * @return           0 on success, -1 on error
+ */
+int hl_hcall_int(const char *func_name,
+		 const struct hl_param *params, int nparams,
+		 __s32 *out);
+
+/**
+ * Call a host function returning u64.
+ */
+int hl_hcall_ulong(const char *func_name,
+		   const struct hl_param *params, int nparams,
+		   __u64 *out);
+
+/**
+ * Call a host function returning String.
+ *
+ * @param out_buf    Buffer to receive the string (NUL-terminated)
+ * @param buf_sz     Size of out_buf
+ * @param out_len    Output: length of string (excluding NUL), or NULL
+ * @return           0 on success, -1 on error
+ */
+int hl_hcall_string(const char *func_name,
+		    const struct hl_param *params, int nparams,
+		    char *out_buf, __sz buf_sz, __sz *out_len);
+
+/**
+ * Call a host function returning Vec<u8>.
+ *
+ * @param out_buf    Buffer to receive the bytes
+ * @param buf_sz     Size of out_buf
+ * @param out_len    Output: number of bytes written
+ * @return           0 on success, -1 on error
+ */
+int hl_hcall_vecbytes(const char *func_name,
+		      const struct hl_param *params, int nparams,
+		      __u8 *out_buf, __sz buf_sz, __sz *out_len);
 
 #endif /* __HYPERLIGHT_HCALL_H__ */

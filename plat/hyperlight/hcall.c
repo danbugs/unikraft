@@ -818,3 +818,463 @@ __u64 hl_call_get_wall_clock_ns(void)
 	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
 	return val;
 }
+
+/* ── Generic FlatBuffer encoder ──────────────────────────────────── */
+
+/*
+ * Encode a size-prefixed FunctionCall FlatBuffer with arbitrary typed
+ * parameters.  Supports hlint, hlulong, hlstring, and hlvecbytes —
+ * enough for all hostfs/hostsock host functions.
+ */
+
+#define VW_SCALAR_VT_SZ  6
+#define VW_INT_TBL_SZ    8	/* [soffset=4, value=4] */
+#define VW_ULONG_TBL_SZ  12	/* [soffset=4, value=8] */
+#define VW_REF_TBL_SZ    8	/* [soffset=4, uoffset=4] */
+#define PM_VT_SZ	  8
+#define PM_TBL_SZ	  12
+
+#define GA2(x) (((x) + 1) & ~(__u64)1)
+#define GA4(x) (((x) + 3) & ~(__u64)3)
+/* Smallest value >= x congruent to 4 mod 8.  Ensures u64 field at
+ * (result + 4) is 8-byte aligned, as the FlatBuffer verifier requires. */
+#define GA8_OFF4(x) ((((x) + 3) & ~(__u64)7) | 4)
+
+struct playout {
+	__u64 pvt, ptbl, vvt, vtbl, vdata;
+	__u16 vvtsz, vtblsz;
+};
+
+static void ew16(__u8 *b, __u64 p, __u16 v)
+{
+	b[p] = v; b[p + 1] = v >> 8;
+}
+
+static void ew32(__u8 *b, __u64 p, __u32 v)
+{
+	b[p] = v; b[p+1] = v >> 8; b[p+2] = v >> 16; b[p+3] = v >> 24;
+}
+
+static void ew64(__u8 *b, __u64 p, __u64 v)
+{
+	ew32(b, p, (__u32)v);
+	ew32(b, p + 4, (__u32)(v >> 32));
+}
+
+static __u64 fb_encode_generic(
+	__u8 *buf, __u64 buf_sz,
+	const char *name,
+	__u8 call_type, __u8 ret_type,
+	const struct hl_param *params, int np)
+{
+	__u64 nlen = strlen(name);
+	__u64 pos;
+	int i;
+	struct playout pl[HL_MAX_PARAMS];
+
+	if (np > HL_MAX_PARAMS)
+		return 0;
+
+	/* ── Pass 1: compute positions ───────────────────────── */
+	/* header: size(4)+root_off(4)+root_vt(12)+root_tbl(16) = 36 */
+	pos = 36;
+
+	__u64 pvec = 0;
+
+	if (np > 0) {
+		pvec = GA4(pos);
+		pos = pvec + 4 + (__u64)np * 4;
+	}
+
+	for (i = 0; i < np; i++) {
+		pl[i].pvt  = GA2(pos);
+		pl[i].ptbl = GA4(pl[i].pvt + PM_VT_SZ);
+
+		switch (params[i].type) {
+		case HL_PV_HLINT: case HL_PV_HLUINT:
+			pl[i].vvtsz  = VW_SCALAR_VT_SZ;
+			pl[i].vtblsz = VW_INT_TBL_SZ;
+			break;
+		case HL_PV_HLLONG: case HL_PV_HLULONG:
+			pl[i].vvtsz  = VW_SCALAR_VT_SZ;
+			pl[i].vtblsz = VW_ULONG_TBL_SZ;
+			break;
+		case HL_PV_HLSTRING: case HL_PV_HLVECBYTES:
+			pl[i].vvtsz  = VW_SCALAR_VT_SZ;
+			pl[i].vtblsz = VW_REF_TBL_SZ;
+			break;
+		default:
+			return 0;
+		}
+
+		pl[i].vvt  = GA2(pl[i].ptbl + PM_TBL_SZ);
+		/* u64 field at vtbl+4 must be 8-byte aligned */
+		if (params[i].type == HL_PV_HLLONG ||
+		    params[i].type == HL_PV_HLULONG)
+			pl[i].vtbl = GA8_OFF4(pl[i].vvt + pl[i].vvtsz);
+		else
+			pl[i].vtbl = GA4(pl[i].vvt + pl[i].vvtsz);
+		pl[i].vdata = 0;
+		pos = pl[i].vtbl + pl[i].vtblsz;
+	}
+
+	/* Variable-length data (strings, vectors) */
+	for (i = 0; i < np; i++) {
+		if (params[i].type == HL_PV_HLSTRING) {
+			pl[i].vdata = GA4(pos);
+			pos = pl[i].vdata + 4
+			    + GA4(params[i].str.len + 1);
+		} else if (params[i].type == HL_PV_HLVECBYTES) {
+			pl[i].vdata = GA4(pos);
+			__u64 dlen = params[i].vec.len;
+
+			pos = pl[i].vdata + 4 + GA4(dlen ? dlen : 1);
+		}
+	}
+
+	__u64 fnpos = GA4(pos);
+
+	pos = fnpos + 4 + GA4(nlen + 1);
+
+	__u64 total = pos;
+
+	if (total > buf_sz)
+		return 0;
+
+	/* ── Pass 2: emit bytes ──────────────────────────────── */
+	memset(buf, 0, total);
+
+	ew32(buf, 0, (__u32)(total - 4));
+	ew32(buf, 4, 16);			/* root offset */
+
+	/* Root vtable at 8 */
+	ew16(buf, 8, 12);  ew16(buf, 10, 16);
+	ew16(buf, 12, 4);  ew16(buf, 14, np > 0 ? 8 : 0);
+	ew16(buf, 16, 12); ew16(buf, 18, 13);
+
+	/* Root table at 20 */
+	ew32(buf, 20, 12);			/* soffset → vt@8 */
+	ew32(buf, 24, (__u32)(fnpos - 24));
+	if (np > 0)
+		ew32(buf, 28, (__u32)(pvec - 28));
+	buf[32] = call_type;
+	buf[33] = ret_type;
+
+	/* Params vector */
+	if (np > 0) {
+		ew32(buf, pvec, (__u32)np);
+		for (i = 0; i < np; i++) {
+			__u64 ep = pvec + 4 + (__u64)i * 4;
+
+			ew32(buf, ep,
+			     (__u32)(pl[i].ptbl - ep));
+		}
+	}
+
+	/* Each parameter */
+	for (i = 0; i < np; i++) {
+		ew16(buf, pl[i].pvt,     PM_VT_SZ);
+		ew16(buf, pl[i].pvt + 2, PM_TBL_SZ);
+		ew16(buf, pl[i].pvt + 4, 4);
+		ew16(buf, pl[i].pvt + 6, 8);
+
+		ew32(buf, pl[i].ptbl,
+		     (__u32)(pl[i].ptbl - pl[i].pvt));
+		buf[pl[i].ptbl + 4] = params[i].type;
+		ew32(buf, pl[i].ptbl + 8,
+		     (__u32)(pl[i].vtbl - (pl[i].ptbl + 8)));
+
+		ew16(buf, pl[i].vvt,     pl[i].vvtsz);
+		ew16(buf, pl[i].vvt + 2, pl[i].vtblsz);
+		ew16(buf, pl[i].vvt + 4, 4);
+
+		ew32(buf, pl[i].vtbl,
+		     (__u32)(pl[i].vtbl - pl[i].vvt));
+
+		switch (params[i].type) {
+		case HL_PV_HLINT:
+			ew32(buf, pl[i].vtbl + 4,
+			     (__u32)params[i].i32_val);
+			break;
+		case HL_PV_HLUINT:
+			ew32(buf, pl[i].vtbl + 4, params[i].u32_val);
+			break;
+		case HL_PV_HLLONG:
+			ew64(buf, pl[i].vtbl + 4,
+			     (__u64)params[i].i64_val);
+			break;
+		case HL_PV_HLULONG:
+			ew64(buf, pl[i].vtbl + 4, params[i].u64_val);
+			break;
+		case HL_PV_HLSTRING:
+			ew32(buf, pl[i].vtbl + 4,
+			     (__u32)(pl[i].vdata - (pl[i].vtbl + 4)));
+			ew32(buf, pl[i].vdata, params[i].str.len);
+			memcpy(buf + pl[i].vdata + 4,
+			       params[i].str.ptr, params[i].str.len);
+			break;
+		case HL_PV_HLVECBYTES:
+			ew32(buf, pl[i].vtbl + 4,
+			     (__u32)(pl[i].vdata - (pl[i].vtbl + 4)));
+			ew32(buf, pl[i].vdata, params[i].vec.len);
+			if (params[i].vec.len > 0)
+				memcpy(buf + pl[i].vdata + 4,
+				       params[i].vec.ptr,
+				       params[i].vec.len);
+			break;
+		}
+	}
+
+	/* Function name string */
+	ew32(buf, fnpos, (__u32)nlen);
+	memcpy(buf + fnpos + 4, name, nlen);
+
+	return total;
+}
+
+/* ── Additional FunctionCallResult decoders ──────────────────────── */
+
+static int fb_decode_result_int(const __u8 *buf, __u64 buf_len,
+				__s32 *out_val)
+{
+	if (buf_len < 8)
+		return -1;
+
+	__u64 root = 4 + fb_u32(buf, 4);
+
+	if (fb_u8_default(buf, root, VT_FCR_RESULT_TYPE, 0)
+	    != HL_FCRT_RETURN_VALUE)
+		return -1;
+
+	__u64 rvb = fb_follow(buf, root, VT_FCR_RESULT);
+
+	if (!rvb)
+		return -1;
+
+	if (fb_u8_default(buf, rvb, VT_RVB_VALUE_TYPE, 0) != HL_RV_HLINT)
+		return -1;
+
+	__u64 hli = fb_follow(buf, rvb, VT_RVB_VALUE);
+
+	if (!hli)
+		return -1;
+
+	__u16 foff = fb_field(buf, hli, VT_HLS_VALUE);
+
+	if (!foff) {
+		/* Field absent → value is the FlatBuffer default (0). */
+		*out_val = 0;
+	} else {
+		*out_val = fb_i32(buf, hli + foff);
+	}
+	return 0;
+}
+
+#define VT_SPB_VALUE 6
+
+static int fb_decode_result_vecbytes(const __u8 *buf, __u64 buf_len,
+				     const __u8 **out_data, __u64 *out_len)
+{
+	if (buf_len < 8)
+		return -1;
+
+	__u64 root = 4 + fb_u32(buf, 4);
+
+	if (fb_u8_default(buf, root, VT_FCR_RESULT_TYPE, 0)
+	    != HL_FCRT_RETURN_VALUE)
+		return -1;
+
+	__u64 rvb = fb_follow(buf, root, VT_FCR_RESULT);
+
+	if (!rvb)
+		return -1;
+
+	if (fb_u8_default(buf, rvb, VT_RVB_VALUE_TYPE, 0)
+	    != HL_RV_HLSIZEPREFIXED)
+		return -1;
+
+	__u64 spb = fb_follow(buf, rvb, VT_RVB_VALUE);
+
+	if (!spb)
+		return -1;
+
+	__u64 vec = fb_follow(buf, spb, VT_SPB_VALUE);
+
+	if (!vec) {
+		*out_data = NULL;
+		*out_len = 0;
+		return 0;
+	}
+
+	__u32 vlen = fb_u32(buf, vec);
+
+	if (vec + 4 + vlen > buf_len)
+		return -1;
+
+	*out_data = buf + vec + 4;
+	*out_len = vlen;
+	return 0;
+}
+
+/* ── Generic host call public API ────────────────────────────────── */
+
+static __u8 g_generic_fc_buf[65536];
+
+int hl_hcall_int(const char *func_name,
+		 const struct hl_param *params, int nparams,
+		 __s32 *out)
+{
+	__u64 fc_len;
+	const __u8 *rd;
+	__u64 rl;
+	unsigned long irqf;
+
+	if (!g_hcall_ready)
+		return -1;
+
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
+	fc_len = fb_encode_generic(g_generic_fc_buf, sizeof(g_generic_fc_buf),
+				   func_name, HL_FCT_HOST, HL_RT_INT,
+				   params, nparams);
+	if (!fc_len)
+		goto err;
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  g_generic_fc_buf, fc_len) < 0)
+		goto err;
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+	if (hl_stack_pop(g_input_stack, &rd, &rl) < 0)
+		goto err;
+	if (fb_decode_result_int(rd, rl, out) < 0)
+		goto err;
+
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return 0;
+err:
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return -1;
+}
+
+int hl_hcall_ulong(const char *func_name,
+		   const struct hl_param *params, int nparams,
+		   __u64 *out)
+{
+	__u64 fc_len;
+	const __u8 *rd;
+	__u64 rl;
+	unsigned long irqf;
+
+	if (!g_hcall_ready)
+		return -1;
+
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
+	fc_len = fb_encode_generic(g_generic_fc_buf, sizeof(g_generic_fc_buf),
+				   func_name, HL_FCT_HOST, HL_RT_ULONG,
+				   params, nparams);
+	if (!fc_len)
+		goto err;
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  g_generic_fc_buf, fc_len) < 0)
+		goto err;
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+	if (hl_stack_pop(g_input_stack, &rd, &rl) < 0)
+		goto err;
+	if (fb_decode_result_ulong(rd, rl, out) < 0)
+		goto err;
+
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return 0;
+err:
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return -1;
+}
+
+int hl_hcall_string(const char *func_name,
+		    const struct hl_param *params, int nparams,
+		    char *out_buf, __sz buf_sz, __sz *out_len)
+{
+	__u64 fc_len;
+	const __u8 *rd;
+	__u64 rl;
+	const char *s;
+	__u64 sl;
+	unsigned long irqf;
+
+	if (!g_hcall_ready)
+		return -1;
+
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
+	fc_len = fb_encode_generic(g_generic_fc_buf, sizeof(g_generic_fc_buf),
+				   func_name, HL_FCT_HOST, HL_RT_STRING,
+				   params, nparams);
+	if (!fc_len)
+		goto err;
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  g_generic_fc_buf, fc_len) < 0)
+		goto err;
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+	if (hl_stack_pop(g_input_stack, &rd, &rl) < 0)
+		goto err;
+	if (fb_decode_result_string(rd, rl, &s, &sl) < 0)
+		goto err;
+	if (sl >= buf_sz)
+		goto err;
+	memcpy(out_buf, s, sl);
+	out_buf[sl] = '\0';
+	if (out_len)
+		*out_len = sl;
+
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return 0;
+err:
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return -1;
+}
+
+int hl_hcall_vecbytes(const char *func_name,
+		      const struct hl_param *params, int nparams,
+		      __u8 *out_buf, __sz buf_sz, __sz *out_len)
+{
+	__u64 fc_len;
+	const __u8 *rd;
+	__u64 rl;
+	const __u8 *vd;
+	__u64 vl;
+	unsigned long irqf;
+
+	if (!g_hcall_ready)
+		return -1;
+
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
+	fc_len = fb_encode_generic(g_generic_fc_buf, sizeof(g_generic_fc_buf),
+				   func_name, HL_FCT_HOST, HL_RT_VECBYTES,
+				   params, nparams);
+	if (!fc_len)
+		goto err;
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  g_generic_fc_buf, fc_len) < 0)
+		goto err;
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+	if (hl_stack_pop(g_input_stack, &rd, &rl) < 0)
+		goto err;
+	if (fb_decode_result_vecbytes(rd, rl, &vd, &vl) < 0)
+		goto err;
+	if (vl > buf_sz)
+		vl = buf_sz;
+	if (vl > 0 && vd)
+		memcpy(out_buf, vd, vl);
+	*out_len = vl;
+
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return 0;
+err:
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return -1;
+}
