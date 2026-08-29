@@ -1,0 +1,5 @@
+config LIBHOSTSOCK
+	bool "hostsock: host networking pass-through via Hyperlight hcalls"
+	default n
+	depends on LIBPOSIX_SOCKET
+	depends on PLAT_HYPERLIGHT

@@ -1,0 +1,5 @@
+config LIBHOSTFS
+	bool "hostfs: host filesystem pass-through via Hyperlight hcalls"
+	default n
+	depends on LIBVFSCORE
+	depends on PLAT_HYPERLIGHT

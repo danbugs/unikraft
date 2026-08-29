@@ -160,15 +160,45 @@ __u32 ukplat_time_get_irq(void)
  * Without hw-interrupts enabled, there is no timer IRQ to wake us
  * from HLT, so we spin-wait on the TSC instead.
  *
+ * When hostsock is compiled in, we periodically poll tracked sockets
+ * via hostsock_rescan_events() so threads blocked on socket I/O
+ * (accept, recv) get woken when data arrives.  This enables
+ * intra-guest networking: a server thread can yield via EAGAIN
+ * while a client thread connects and sends data.
+ *
  * TODO: When hw-interrupts support is implemented, use HLT with
  * the PvTimer to get proper idle-wait instead of busy-looping.
  */
+#ifdef CONFIG_LIBHOSTSOCK
+extern int hostsock_rescan_events(void);
+#endif
+
 void time_block_until(__snsec until)
 {
-	while ((__snsec)ukplat_monotonic_clock() < until) {
+#ifdef CONFIG_LIBHOSTSOCK
+	__snsec next_rescan = 0;
+#endif
+	__snsec now;
+
+	while ((now = (__snsec)ukplat_monotonic_clock()) < until) {
 		uk_arch_x86_64_nop();
 
 		if (uk_and_relax(&sched_have_pending_events, 0))
 			break;
+
+#ifdef CONFIG_LIBHOSTSOCK
+		/* Poll tracked sockets every ~1 ms to wake blocked
+		 * threads.  Each rescan is a non-blocking net_poll
+		 * host call per tracked socket.
+		 *
+		 * TODO: Replace polling with event-driven wakeup —
+		 * host-side epoll thread + irqfd injection would
+		 * eliminate the 1 ms latency floor entirely. */
+		if (now >= next_rescan) {
+			if (hostsock_rescan_events())
+				break;
+			next_rescan = now + 1000000; /* 1 ms */
+		}
+#endif
 	}
 }

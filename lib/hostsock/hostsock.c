@@ -1,0 +1,836 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/* Copyright (c) 2024, Unikraft GmbH and The Unikraft Authors. */
+
+/*
+ * hostsock — Unikraft socket driver backed by Hyperlight host functions.
+ *
+ * Each socket operation makes a synchronous host call via hl_hcall_*.
+ * The host manages the real sockets; the guest only holds an i32 fd
+ * as driver-specific data.
+ *
+ * Registers for AF_INET (2) and AF_INET6 (10).
+ */
+
+#include <uk/essentials.h>
+#include <uk/alloc.h>
+#include <uk/errptr.h>
+#include <uk/print.h>
+
+#include <uk/socket_driver.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+#include <hyperlight-x86/hcall.h>
+
+/*
+ * Static I/O buffers — too large for the stack (64 KB each would overflow
+ * musl's 80 KB default thread stack).  Single vCPU + spinlock in the hcall
+ * path guarantees exclusive access.
+ */
+static __u8 g_recv_buf[4 + 7 + 16 + 65536]; /* header + addr + data */
+static __u8 g_send_buf[65536];
+
+/*
+ * Maximum payload for a single hcall send — the FlatBuffer encoder
+ * (g_generic_fc_buf) is 64 KiB, of which ~256 bytes are headers/metadata.
+ * Cap user data at 60 KiB to leave headroom.  sendall() loops call
+ * send() repeatedly, so the kernel returning a short count is correct.
+ */
+#define HCALL_SEND_MAX  (60 * 1024)
+
+/* ── Tracked sockets for poll rescan ─────────────────────────────── */
+
+#define MAX_TRACKED 64
+static posix_sock *tracked_socks[MAX_TRACKED];
+static int tracked_count;
+
+static void hostsock_track(posix_sock *sock)
+{
+	for (int i = 0; i < tracked_count; i++)
+		if (tracked_socks[i] == sock)
+			return;
+	if (tracked_count < MAX_TRACKED) {
+		tracked_socks[tracked_count++] = sock;
+	} else {
+		uk_pr_warn("hostsock: too many tracked sockets (%d), "
+			   "socket won't participate in idle-loop wakeups\n",
+			   MAX_TRACKED);
+	}
+}
+
+static void hostsock_untrack(posix_sock *sock)
+{
+	for (int i = 0; i < tracked_count; i++) {
+		if (tracked_socks[i] == sock) {
+			tracked_socks[i] = tracked_socks[--tracked_count];
+			return;
+		}
+	}
+}
+
+/* ── Helpers ──────────────────────────────────────────────────────── */
+
+/* The driver-specific data is just the host-side fd stored as (void *)(intptr_t). */
+static inline int sock_fd(posix_sock *sock)
+{
+	return (int)(intptr_t)posix_sock_get_data(sock);
+}
+
+/* Format an IPv4 address as "d.d.d.d". */
+static void fmt_ipv4(char *buf, size_t sz, const struct in_addr *addr)
+{
+	const unsigned char *b = (const unsigned char *)addr;
+
+	snprintf(buf, sz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+
+/* Format an IPv6 address in abbreviated hex notation. */
+static void fmt_ipv6(char *buf, size_t sz, const struct in6_addr *addr)
+{
+	const unsigned char *b = (const unsigned char *)addr;
+
+	snprintf(buf, sz,
+		 "%x:%x:%x:%x:%x:%x:%x:%x",
+		 (b[0] << 8) | b[1], (b[2] << 8) | b[3],
+		 (b[4] << 8) | b[5], (b[6] << 8) | b[7],
+		 (b[8] << 8) | b[9], (b[10] << 8) | b[11],
+		 (b[12] << 8) | b[13], (b[14] << 8) | b[15]);
+}
+
+/*
+ * Format a sockaddr into (family, addr_string, port) for the host.
+ * Returns 0 on success, -errno on failure.
+ */
+static int format_addr(const struct sockaddr *addr, socklen_t addrlen,
+		       int *family, char *addrbuf, size_t addrbuf_sz,
+		       int *port)
+{
+	if (addr->sa_family == AF_INET) {
+		const struct sockaddr_in *sin =
+			(const struct sockaddr_in *)addr;
+
+		if (addrlen < sizeof(*sin))
+			return -EINVAL;
+
+		*family = AF_INET;
+		*port = ntohs(sin->sin_port);
+		fmt_ipv4(addrbuf, addrbuf_sz, &sin->sin_addr);
+		return 0;
+	} else if (addr->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *sin6 =
+			(const struct sockaddr_in6 *)addr;
+
+		if (addrlen < sizeof(*sin6))
+			return -EINVAL;
+
+		*family = AF_INET6;
+		*port = ntohs(sin6->sin6_port);
+		fmt_ipv6(addrbuf, addrbuf_sz, &sin6->sin6_addr);
+		return 0;
+	}
+
+	return -EAFNOSUPPORT;
+}
+
+/*
+ * Decode a packed address from a host result buffer into a sockaddr.
+ *
+ * Packed format at buf[off..]:
+ *   i32 family, u16 port, u8 addr_len, [addr_len] addr bytes
+ *
+ * Returns number of bytes consumed, or 0 on error.
+ */
+static size_t unpack_addr(const __u8 *buf, size_t len, size_t off,
+			  struct sockaddr *addr, socklen_t *addrlen)
+{
+	if (off + 7 > len)
+		return 0;
+
+	int32_t family = buf[off] | (buf[off+1] << 8) |
+			 (buf[off+2] << 16) | (buf[off+3] << 24);
+	uint16_t port = buf[off+4] | (buf[off+5] << 8);
+	uint8_t alen = buf[off+6];
+
+	if (off + 7 + alen > len)
+		return 0;
+
+	if (family == AF_INET && alen == 4) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+
+		if (addrlen && *addrlen < sizeof(*sin))
+			return 0;
+
+		memset(sin, 0, sizeof(*sin));
+		sin->sin_family = AF_INET;
+		sin->sin_port = htons(port);
+		memcpy(&sin->sin_addr, buf + off + 7, 4);
+		if (addrlen)
+			*addrlen = sizeof(*sin);
+		return 7 + alen;
+	} else if (family == AF_INET6 && alen == 16) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+
+		if (addrlen && *addrlen < sizeof(*sin6))
+			return 0;
+
+		memset(sin6, 0, sizeof(*sin6));
+		sin6->sin6_family = AF_INET6;
+		sin6->sin6_port = htons(port);
+		memcpy(&sin6->sin6_addr, buf + off + 7, 16);
+		if (addrlen)
+			*addrlen = sizeof(*sin6);
+		return 7 + alen;
+	}
+
+	return 0;
+}
+
+static inline __s32 rd_i32(const __u8 *b, size_t off)
+{
+	return (__s32)(b[off] | (b[off+1] << 8) |
+		      (b[off+2] << 16) | (b[off+3] << 24));
+}
+
+/*
+ * Check if a host socket has pending events using net_poll(timeout=0).
+ *
+ * This is critical for intra-guest networking: a blocking host call
+ * (accept, recv) freezes the single vCPU, preventing other guest
+ * threads from running.  By polling with timeout=0 first and returning
+ * -EAGAIN when not ready, we let Unikraft's scheduler yield to other
+ * threads that can make progress (e.g. a client connecting).
+ */
+static int hostsock_check_ready(int host_fd, int events)
+{
+	/* Pack one pollfd: i32 fd + i16 events + i16 pad = 8 bytes */
+	__u8 req[8];
+	__u8 resp[6]; /* i32 retval + i16 revents */
+	__sz resp_len;
+
+	req[0] = host_fd & 0xFF;
+	req[1] = (host_fd >> 8) & 0xFF;
+	req[2] = (host_fd >> 16) & 0xFF;
+	req[3] = (host_fd >> 24) & 0xFF;
+	req[4] = events & 0xFF;
+	req[5] = (events >> 8) & 0xFF;
+	req[6] = 0;
+	req[7] = 0;
+
+	struct hl_param p[2];
+
+	p[0].type = HL_PV_HLVECBYTES;
+	p[0].vec.ptr = req;
+	p[0].vec.len = sizeof(req);
+	p[1].type = HL_PV_HLINT;
+	p[1].i32_val = 0; /* timeout_ms = 0 (non-blocking) */
+
+	if (hl_hcall_vecbytes("net_poll", p, 2,
+			      resp, sizeof(resp), &resp_len) < 0)
+		return 0;
+
+	if (resp_len < 6)
+		return 0;
+
+	/* retval at [0..4], revents at [4..6] */
+	__s32 retval = rd_i32(resp, 0);
+
+	if (retval <= 0)
+		return 0;
+
+	return (int)(__s16)(resp[4] | (resp[5] << 8));
+}
+
+/* ── Socket operations ───────────────────────────────────────────── */
+
+static void *
+hostsock_create(struct posix_socket_driver *d __unused,
+		int family, int type, int protocol)
+{
+	struct hl_param p[3];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT; p[0].i32_val = family;
+	p[1].type = HL_PV_HLINT; p[1].i32_val = type;
+	p[2].type = HL_PV_HLINT; p[2].i32_val = protocol;
+
+	if (hl_hcall_int("net_socket", p, 3, &ret) < 0)
+		return ERR2PTR(-EIO);
+
+	if (ret < 0)
+		return ERR2PTR(ret);
+
+	return (void *)(intptr_t)ret;
+}
+
+static int
+hostsock_bind(posix_sock *sock,
+	      const struct sockaddr *addr, socklen_t addrlen)
+{
+	int family, port;
+	char addrbuf[64];
+
+	int err = format_addr(addr, addrlen, &family, addrbuf,
+			      sizeof(addrbuf), &port);
+	if (err)
+		return err;
+
+	struct hl_param p[4];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT;    p[0].i32_val = sock_fd(sock);
+	p[1].type = HL_PV_HLINT;    p[1].i32_val = family;
+	p[2].type = HL_PV_HLSTRING; p[2].str.ptr = addrbuf;
+				     p[2].str.len = strlen(addrbuf);
+	p[3].type = HL_PV_HLINT;    p[3].i32_val = port;
+
+	if (hl_hcall_int("net_bind", p, 4, &ret) < 0)
+		return -EIO;
+
+	return ret < 0 ? ret : 0;
+}
+
+static int
+hostsock_listen(posix_sock *sock, int backlog)
+{
+	struct hl_param p[2];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT; p[0].i32_val = sock_fd(sock);
+	p[1].type = HL_PV_HLINT; p[1].i32_val = backlog;
+
+	if (hl_hcall_int("net_listen", p, 2, &ret) < 0)
+		return -EIO;
+
+	return ret < 0 ? ret : 0;
+}
+
+static void *
+hostsock_accept4(posix_sock *sock,
+		 struct sockaddr *restrict addr,
+		 socklen_t *restrict addrlen,
+		 int flags __unused)
+{
+	/*
+	 * Check readiness before calling the host's accept.  A blocking
+	 * host call freezes the entire VM (single vCPU), so we must never
+	 * let accept block on the host side.  Return EAGAIN and let
+	 * Unikraft's poll/scheduler layer handle the wait.
+	 */
+	{
+		int ready = hostsock_check_ready(sock_fd(sock), POLLIN);
+
+		if (!(ready & POLLIN))
+			return ERR2PTR(-EAGAIN);
+	}
+
+	struct hl_param p[1];
+	__u8 buf[64];
+	__sz len;
+
+	p[0].type = HL_PV_HLINT;
+	p[0].i32_val = sock_fd(sock);
+
+	if (hl_hcall_vecbytes("net_accept", p, 1, buf, sizeof(buf), &len) < 0)
+		return ERR2PTR(-EIO);
+
+	if (len < 4)
+		return ERR2PTR(-EIO);
+
+	__s32 new_fd = rd_i32(buf, 0);
+
+	if (new_fd < 0)
+		return ERR2PTR(new_fd);
+
+	if (addr && addrlen && len > 4)
+		unpack_addr(buf, len, 4, addr, addrlen);
+
+	return (void *)(intptr_t)new_fd;
+}
+
+static int
+hostsock_connect(posix_sock *sock,
+		 const struct sockaddr *addr, socklen_t addrlen)
+{
+	int family, port;
+	char addrbuf[64];
+
+	int err = format_addr(addr, addrlen, &family, addrbuf,
+			      sizeof(addrbuf), &port);
+	if (err)
+		return err;
+
+	struct hl_param p[4];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT;    p[0].i32_val = sock_fd(sock);
+	p[1].type = HL_PV_HLINT;    p[1].i32_val = family;
+	p[2].type = HL_PV_HLSTRING; p[2].str.ptr = addrbuf;
+				     p[2].str.len = strlen(addrbuf);
+	p[3].type = HL_PV_HLINT;    p[3].i32_val = port;
+
+	if (hl_hcall_int("net_connect", p, 4, &ret) < 0)
+		return -EIO;
+
+	return ret < 0 ? ret : 0;
+}
+
+static int
+hostsock_shutdown(posix_sock *sock, int how)
+{
+	struct hl_param p[2];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT; p[0].i32_val = sock_fd(sock);
+	p[1].type = HL_PV_HLINT; p[1].i32_val = how;
+
+	if (hl_hcall_int("net_shutdown", p, 2, &ret) < 0)
+		return -EIO;
+
+	return ret < 0 ? ret : 0;
+}
+
+static ssize_t
+hostsock_sendto(posix_sock *sock, const void *buf, size_t len,
+		int flags __unused,
+		const struct sockaddr *dest_addr, socklen_t addrlen)
+{
+	/*
+	 * Check writability before calling the host's send/sendto.
+	 * A blocking send on a full socket buffer freezes the VM's
+	 * single vCPU, preventing the receiver thread from draining
+	 * the buffer.  Return EAGAIN and let the scheduler yield.
+	 */
+	{
+		int ready = hostsock_check_ready(sock_fd(sock), POLLOUT);
+
+		if (!(ready & POLLOUT))
+			return -EAGAIN;
+	}
+
+	/* Cap to hcall buffer capacity — sendall() loops will retry. */
+	if (len > HCALL_SEND_MAX)
+		len = HCALL_SEND_MAX;
+
+	if (dest_addr) {
+		/* sendto with destination */
+		int family, port;
+		char addrbuf[64];
+		int err = format_addr(dest_addr, addrlen, &family, addrbuf,
+				      sizeof(addrbuf), &port);
+		if (err)
+			return err;
+
+		struct hl_param p[5];
+		__s32 ret;
+
+		p[0].type = HL_PV_HLINT;     p[0].i32_val = sock_fd(sock);
+		p[1].type = HL_PV_HLVECBYTES; p[1].vec.ptr = (const __u8 *)buf;
+					       p[1].vec.len = len;
+		p[2].type = HL_PV_HLINT;      p[2].i32_val = family;
+		p[3].type = HL_PV_HLSTRING;   p[3].str.ptr = addrbuf;
+					       p[3].str.len = strlen(addrbuf);
+		p[4].type = HL_PV_HLINT;      p[4].i32_val = port;
+
+		if (hl_hcall_int("net_sendto", p, 5, &ret) < 0)
+			return -EIO;
+
+		return ret;
+	} else {
+		/* send (no destination) */
+		struct hl_param p[2];
+		__s32 ret;
+
+		p[0].type = HL_PV_HLINT;     p[0].i32_val = sock_fd(sock);
+		p[1].type = HL_PV_HLVECBYTES; p[1].vec.ptr = (const __u8 *)buf;
+					       p[1].vec.len = len;
+
+		if (hl_hcall_int("net_send", p, 2, &ret) < 0)
+			return -EIO;
+
+		return ret;
+	}
+}
+
+static ssize_t
+hostsock_recvfrom(posix_sock *sock, void *restrict buf, size_t len,
+		  int flags __unused,
+		  struct sockaddr *from, socklen_t *restrict fromlen)
+{
+	/*
+	 * Check readiness — a blocking recv host call would freeze the
+	 * entire VM.  See the comment in hostsock_accept4.
+	 */
+	{
+		int ready = hostsock_check_ready(sock_fd(sock), POLLIN);
+
+		if (!(ready & POLLIN))
+			return -EAGAIN;
+	}
+
+	struct hl_param p[2];
+	__sz rlen;
+
+	p[0].type = HL_PV_HLINT; p[0].i32_val = sock_fd(sock);
+	p[1].type = HL_PV_HLINT; p[1].i32_val = len > 65536 ? 65536 : len;
+
+	if (hl_hcall_vecbytes("net_recvfrom", p, 2,
+			      g_recv_buf, sizeof(g_recv_buf), &rlen) < 0)
+		return -EIO;
+
+	if (rlen < 4)
+		return -EIO;
+
+	__s32 nbytes = rd_i32(g_recv_buf, 0);
+
+	if (nbytes < 0)
+		return nbytes;
+
+	/* Decode the source address. */
+	size_t addr_consumed = 0;
+
+	if (rlen > 4 && from && fromlen)
+		addr_consumed = unpack_addr(g_recv_buf, rlen, 4, from, fromlen);
+	else if (rlen > 4)
+		/* Skip the addr even if caller doesn't want it. */
+		addr_consumed = 7 + (rlen > 10 ? g_recv_buf[10] : 0);
+
+	/* Copy received data. */
+	size_t data_off = 4 + addr_consumed;
+	size_t data_avail = rlen > data_off ? rlen - data_off : 0;
+	size_t copy = data_avail < len ? data_avail : len;
+
+	if (copy > 0)
+		memcpy(buf, g_recv_buf + data_off, copy);
+
+	return (ssize_t)copy;
+}
+
+static ssize_t
+hostsock_write(posix_sock *sock, const struct iovec *iov, size_t iovcnt)
+{
+	/* Check writability — same guard as sendto. */
+	{
+		int ready = hostsock_check_ready(sock_fd(sock), POLLOUT);
+
+		if (!(ready & POLLOUT))
+			return -EAGAIN;
+	}
+
+	/* Gather all iovecs into a single buffer and call net_send. */
+	size_t total = 0;
+
+	for (size_t i = 0; i < iovcnt; i++)
+		total += iov[i].iov_len;
+
+	if (total > sizeof(g_send_buf)) {
+		uk_pr_warn("hostsock: write truncated from %zu to %zu bytes\n",
+			   total, sizeof(g_send_buf));
+		total = sizeof(g_send_buf);
+	}
+
+	size_t off = 0;
+
+	for (size_t i = 0; i < iovcnt && off < total; i++) {
+		size_t chunk = iov[i].iov_len;
+
+		if (off + chunk > total)
+			chunk = total - off;
+		memcpy(g_send_buf + off, iov[i].iov_base, chunk);
+		off += chunk;
+	}
+
+	struct hl_param p[2];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT;      p[0].i32_val = sock_fd(sock);
+	p[1].type = HL_PV_HLVECBYTES; p[1].vec.ptr = g_send_buf;
+				       p[1].vec.len = off;
+
+	if (hl_hcall_int("net_send", p, 2, &ret) < 0)
+		return -EIO;
+
+	return ret;
+}
+
+static ssize_t
+hostsock_read(posix_sock *sock, const struct iovec *iov, size_t iovcnt)
+{
+	if (iovcnt == 0)
+		return 0;
+
+	/* Read into the first iovec only, clamped to its actual size.
+	 * POSIX allows short reads, so the caller retries as needed. */
+	return hostsock_recvfrom(sock, iov[0].iov_base, iov[0].iov_len,
+				 0, NULL, NULL);
+}
+
+static int
+hostsock_close(posix_sock *sock)
+{
+	hostsock_untrack(sock);
+
+	struct hl_param p[1];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT;
+	p[0].i32_val = sock_fd(sock);
+
+	if (hl_hcall_int("net_close", p, 1, &ret) < 0)
+		return -EIO;
+
+	return 0;
+}
+
+static int
+hostsock_getpeername(posix_sock *sock,
+		    struct sockaddr *restrict addr,
+		    socklen_t *restrict addrlen)
+{
+	struct hl_param p[1];
+	__u8 buf[32];
+	__sz len;
+
+	p[0].type = HL_PV_HLINT;
+	p[0].i32_val = sock_fd(sock);
+
+	if (hl_hcall_vecbytes("net_getpeername", p, 1,
+			      buf, sizeof(buf), &len) < 0)
+		return -EIO;
+
+	if (len < 4)
+		return -EIO;
+
+	__s32 status = rd_i32(buf, 0);
+
+	if (status < 0)
+		return status;
+
+	if (addr && addrlen)
+		unpack_addr(buf, len, 4, addr, addrlen);
+
+	return 0;
+}
+
+static int
+hostsock_getsockname(posix_sock *sock,
+		     struct sockaddr *restrict addr,
+		     socklen_t *restrict addrlen)
+{
+	struct hl_param p[1];
+	__u8 buf[32];
+	__sz len;
+
+	p[0].type = HL_PV_HLINT;
+	p[0].i32_val = sock_fd(sock);
+
+	if (hl_hcall_vecbytes("net_getsockname", p, 1,
+			      buf, sizeof(buf), &len) < 0)
+		return -EIO;
+
+	if (len < 4)
+		return -EIO;
+
+	__s32 status = rd_i32(buf, 0);
+
+	if (status < 0)
+		return status;
+
+	if (addr && addrlen)
+		unpack_addr(buf, len, 4, addr, addrlen);
+
+	return 0;
+}
+
+static int
+hostsock_getsockopt(posix_sock *sock, int level, int optname,
+		    void *restrict optval, socklen_t *restrict optlen)
+{
+	struct hl_param p[3];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT; p[0].i32_val = sock_fd(sock);
+	p[1].type = HL_PV_HLINT; p[1].i32_val = level;
+	p[2].type = HL_PV_HLINT; p[2].i32_val = optname;
+
+	if (hl_hcall_int("net_getsockopt", p, 3, &ret) < 0)
+		return -EIO;
+
+	if (ret < 0)
+		return ret;
+
+	/* Write the option value back. */
+	if (optval && optlen && *optlen >= sizeof(int)) {
+		*(int *)optval = ret;
+		*optlen = sizeof(int);
+	}
+
+	return 0;
+}
+
+static int
+hostsock_setsockopt(posix_sock *sock, int level, int optname,
+		    const void *optval, socklen_t optlen)
+{
+	int value = 0;
+
+	if (optval && optlen >= sizeof(int))
+		value = *(const int *)optval;
+
+	struct hl_param p[4];
+	__s32 ret;
+
+	p[0].type = HL_PV_HLINT; p[0].i32_val = sock_fd(sock);
+	p[1].type = HL_PV_HLINT; p[1].i32_val = level;
+	p[2].type = HL_PV_HLINT; p[2].i32_val = optname;
+	p[3].type = HL_PV_HLINT; p[3].i32_val = value;
+
+	if (hl_hcall_int("net_setsockopt", p, 4, &ret) < 0)
+		return -EIO;
+
+	return ret < 0 ? ret : 0;
+}
+
+static ssize_t
+hostsock_sendmsg(posix_sock *sock, const struct msghdr *msg, int flags)
+{
+	/* Flatten msg_iov and delegate to sendto. */
+	if (msg->msg_iovlen == 0)
+		return 0;
+
+	size_t total = 0;
+
+	for (size_t i = 0; i < (size_t)msg->msg_iovlen; i++)
+		total += msg->msg_iov[i].iov_len;
+
+	if (total > sizeof(g_send_buf)) {
+		uk_pr_warn("hostsock: sendmsg truncated from %zu to %zu bytes\n",
+			   total, sizeof(g_send_buf));
+		total = sizeof(g_send_buf);
+	}
+
+	size_t off = 0;
+
+	for (size_t i = 0; i < (size_t)msg->msg_iovlen && off < total; i++) {
+		size_t chunk = msg->msg_iov[i].iov_len;
+
+		if (off + chunk > total)
+			chunk = total - off;
+		memcpy(g_send_buf + off, msg->msg_iov[i].iov_base, chunk);
+		off += chunk;
+	}
+
+	return hostsock_sendto(sock, g_send_buf, off, flags,
+			       msg->msg_name, msg->msg_namelen);
+}
+
+static ssize_t
+hostsock_recvmsg(posix_sock *sock, struct msghdr *msg, int flags)
+{
+	/* Receive into first iovec. */
+	if (msg->msg_iovlen == 0)
+		return 0;
+
+	socklen_t addrlen = msg->msg_namelen;
+
+	return hostsock_recvfrom(sock,
+				msg->msg_iov[0].iov_base,
+				msg->msg_iov[0].iov_len,
+				flags,
+				msg->msg_name, &addrlen);
+}
+
+static int
+hostsock_ioctl(posix_sock *sock __unused, int request __unused,
+	       void *argp __unused)
+{
+	return -ENOTSUP;
+}
+
+static void
+hostsock_poll_setup(posix_sock *sock)
+{
+	/* Check real readiness via host poll(timeout=0). */
+	int revents = hostsock_check_ready(sock_fd(sock), POLLIN | POLLOUT);
+	unsigned events = 0;
+
+	if (revents & POLLIN)
+		events |= UKFD_POLLIN;
+	if (revents & POLLOUT)
+		events |= UKFD_POLLOUT;
+
+	posix_sock_event_set(sock, events);
+	hostsock_track(sock);
+}
+
+/*
+ * Rescan all tracked sockets for readiness.  Called from the
+ * platform's idle loop so Unikraft's scheduler can wake threads
+ * that are blocked on socket I/O.
+ *
+ * Returns 1 if any socket has pending events, 0 otherwise.
+ */
+int hostsock_rescan_events(void)
+{
+	int woke = 0;
+
+	for (int i = 0; i < tracked_count; i++) {
+		posix_sock *sock = tracked_socks[i];
+		int revents = hostsock_check_ready(sock_fd(sock),
+						   POLLIN | POLLOUT);
+		unsigned events = 0;
+
+		if (revents & POLLIN)
+			events |= UKFD_POLLIN;
+		if (revents & POLLOUT)
+			events |= UKFD_POLLOUT;
+
+		if (events) {
+			posix_sock_event_set(sock, events);
+			woke = 1;
+		}
+	}
+
+	return woke;
+}
+
+/* ── Driver registration ─────────────────────────────────────────── */
+
+static const struct posix_socket_ops hostsock_ops = {
+	.init          = NULL,
+	.create        = hostsock_create,
+	.accept4       = hostsock_accept4,
+	.bind          = hostsock_bind,
+	.shutdown      = hostsock_shutdown,
+	.getpeername   = hostsock_getpeername,
+	.getsockname   = hostsock_getsockname,
+	.getsockopt    = hostsock_getsockopt,
+	.setsockopt    = hostsock_setsockopt,
+	.connect       = hostsock_connect,
+	.listen        = hostsock_listen,
+	.recvfrom      = hostsock_recvfrom,
+	.recvmsg       = hostsock_recvmsg,
+	.sendmsg       = hostsock_sendmsg,
+	.sendto        = hostsock_sendto,
+	.socketpair    = NULL,
+	.socketpair_post = NULL,
+	.write         = hostsock_write,
+	.read          = hostsock_read,
+	.close         = hostsock_close,
+	.ioctl         = hostsock_ioctl,
+#if CONFIG_LIBPOSIX_SOCKET_POLLED
+	.poll          = NULL,
+#endif
+	.poll_setup    = hostsock_poll_setup,
+};
+
+/* Register for AF_INET */
+POSIX_SOCKET_FAMILY_REGISTER(AF_INET, &hostsock_ops);
+
+/* Register for AF_INET6 */
+POSIX_SOCKET_FAMILY_REGISTER(AF_INET6, &hostsock_ops);
