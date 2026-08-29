@@ -21,6 +21,13 @@
  * The console transparently picks HostPrint when the hcall subsystem
  * is ready, falling back to DebugPrint otherwise.
  *
+ * TODO: Route uk_pr_* output through port 99 (Log / OutBAction::Log)
+ * instead of HostPrint (port 101).  Port 99 delivers a GuestLogData
+ * FlatBuffer to the host's tracing framework, keeping kernel warnings
+ * out of the HostPrint capture path (drain_output).  This requires
+ * encoding GuestLogData FlatBuffers (level, source_file, line, source,
+ * message) in the kernel — a different schema from hcall FlatBuffers.
+ *
  * Hyperlight does not provide console input — the guest runs
  * non-interactively — so console_in always returns 0.
  */

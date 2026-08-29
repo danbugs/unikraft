@@ -681,12 +681,6 @@ static inline int vfscore_mount_volume(const struct vfscore_volume *vv)
 		return 0; /* Indicate that we did not mount anything */
 	}
 
-	uk_pr_debug("vfs.fstab: Mounting: %s:%s:%s:0x%lx:%s:0x%x...\n",
-		    vv->sdev == NULL ? "none" : vv->sdev,
-		    vv->path, vv->drv, vv->flags,
-		    vv->opts == NULL ? "" : vv->opts,
-		    vv->ukopts);
-
 	if (vv->ukopts & LIBVFSCORE_UKOPT_MKMP) {
 		rc = vfscore_ukopt_mkmp(path);
 		if (unlikely(rc < 0))
@@ -896,7 +890,6 @@ static int vfscore_automount(struct uk_init_ctx *ictx __unused)
 #endif /* CONFIG_LIBVFSCORE_AUTOMOUNT_CI */
 
 #if CONFIG_LIBVFSCORE_AUTOMOUNT_UP
-	uk_pr_debug("Mounting volumes from user-provided table...\n");
 	rc = vfscore_automount_volumes_up();
 	if (unlikely(rc < 0))
 		goto err_umount;
