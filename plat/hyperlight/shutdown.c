@@ -17,11 +17,17 @@
  */
 
 #include <uk/boot/earlytab.h>
+#include <uk/lcpu.h>
+#include <uk/lcpu/pm.h>
 #include <uk/pm.h>
 #include <uk/prio.h>
 #include <uk/plat/common/bootinfo.h>
 
 #include <hyperlight-x86/outb.h>
+
+#ifdef CONFIG_LIBHOSTSOCK
+extern int hostsock_rescan_events(void);
+#endif
 
 /* Provided by dispatch.c */
 extern void hyperlight_dispatch_function(void)
@@ -61,9 +67,32 @@ static const struct uk_pm_ops hyperlight_pm_ops = {
 	.syscrash   = hyperlight_crash,
 };
 
+/*
+ * LCPU halt_irq — called by the cooperative scheduler's idle thread
+ * when no thread has a timed wakeup (wake_up_time == 0).
+ * Poll hostsock to discover ready sockets and wake blocked threads.
+ */
+static void hyperlight_halt_irq(void)
+{
+	uk_pal_enable_irq();
+#ifdef CONFIG_LIBHOSTSOCK
+	hostsock_rescan_events();
+#endif
+	uk_arch_spinwait();
+}
+
+static const struct uk_lcpu_pm_ops hyperlight_lcpu_pm_ops = {
+	.halt_irq = hyperlight_halt_irq,
+};
+
 static int hyperlight_register_pm_ops(struct ukplat_bootinfo __unused *bi)
 {
-	return uk_pm_ops_register(&hyperlight_pm_ops);
+	int rc;
+
+	rc = uk_pm_ops_register(&hyperlight_pm_ops);
+	if (rc)
+		return rc;
+	return uk_lcpu_pm_ops_register(&hyperlight_lcpu_pm_ops);
 }
 
 UK_BOOT_EARLYTAB_ENTRY(hyperlight_register_pm_ops, UK_PRIO_EARLIEST);
