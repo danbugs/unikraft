@@ -563,6 +563,153 @@ out:
 	return rc;
 }
 
+int hl_call_get_env_vars(char *out_buf, __sz buf_sz)
+{
+	__u8 fc_buf[256];
+	__u64 fc_len;
+	const __u8 *result_data;
+	__u64 result_len;
+	const char *str;
+	__u64 str_len;
+	unsigned long irqf;
+	int rc = -1;
+
+	if (!g_output_stack || !g_input_stack) {
+		uk_pr_err("hcall: not initialised\n");
+		return -1;
+	}
+
+	fc_len = fb_encode_function_call(fc_buf, sizeof(fc_buf),
+					 "GetEnvVars",
+					 HL_FCT_HOST, HL_RT_STRING);
+	if (fc_len == 0) {
+		uk_pr_err("hcall: encode failed\n");
+		return -1;
+	}
+
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  fc_buf, fc_len) < 0)
+		goto out_env;
+
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+		goto out_env;
+
+	if (fb_decode_result_string(result_data, result_len,
+				    &str, &str_len) < 0)
+		goto out_env;
+
+	if (str_len >= buf_sz)
+		goto out_env;
+
+	/*
+	 * Copy the raw bytes — the string contains embedded NULs as
+	 * separators between KEY=VALUE pairs.  Do NOT use strcpy/memcpy
+	 * with str_len+1 (the FlatBuffer string may or may not have a
+	 * trailing NUL).
+	 */
+	memcpy(out_buf, str, str_len);
+	rc = (int)str_len;
+
+out_env:
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return rc;
+}
+
+/*
+ * Buffered stdin — the host returns the entire buffer at once (no
+ * params), so we cache it and hand out bytes on demand.
+ */
+static char g_stdin_buf[8192];
+static __sz g_stdin_pos;
+static __sz g_stdin_len;
+static int  g_stdin_eof;
+
+/*
+ * Fetch the next chunk from the host's stdin buffer.
+ * Returns the number of bytes fetched, or 0 on EOF/error.
+ */
+static int hl_stdin_fetch(void)
+{
+	__u8 fc_buf[256];
+	__u64 fc_len;
+	const __u8 *result_data;
+	__u64 result_len;
+	const char *str;
+	__u64 str_len;
+	unsigned long irqf;
+
+	if (!g_hcall_ready || g_stdin_eof)
+		return 0;
+
+	fc_len = fb_encode_function_call(fc_buf, sizeof(fc_buf),
+					 "ReadStdin",
+					 HL_FCT_HOST, HL_RT_STRING);
+	if (fc_len == 0)
+		return 0;
+
+	ukplat_spin_lock_irqsave(&g_hcall_lock, irqf);
+
+	if (hl_stack_push(g_output_stack, g_output_stack_size,
+			  fc_buf, fc_len) < 0)
+		goto fail;
+
+	hyperlight_out32(HYPERLIGHT_PORT_CALL_FUNCTION, 0);
+
+	if (hl_stack_pop(g_input_stack, &result_data, &result_len) < 0)
+		goto fail;
+
+	if (fb_decode_result_string(result_data, result_len,
+				    &str, &str_len) < 0)
+		goto fail;
+
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+
+	if (str_len == 0) {
+		g_stdin_eof = 1;
+		return 0;
+	}
+
+	if (str_len > sizeof(g_stdin_buf))
+		str_len = sizeof(g_stdin_buf);
+
+	memcpy(g_stdin_buf, str, str_len);
+	g_stdin_pos = 0;
+	g_stdin_len = str_len;
+	return (int)str_len;
+
+fail:
+	ukplat_spin_unlock_irqrestore(&g_hcall_lock, irqf);
+	return 0;
+}
+
+int hl_call_read_stdin(char *out_buf, __sz buf_sz)
+{
+	/* Serve from the guest-side buffer first */
+	if (g_stdin_pos < g_stdin_len) {
+		__sz avail = g_stdin_len - g_stdin_pos;
+		__sz n = avail < buf_sz ? avail : buf_sz;
+
+		memcpy(out_buf, g_stdin_buf + g_stdin_pos, n);
+		g_stdin_pos += n;
+		return (int)n;
+	}
+
+	/* Buffer empty — fetch from host */
+	if (hl_stdin_fetch() <= 0)
+		return 0;
+
+	/* Serve what we just fetched */
+	__sz n = g_stdin_len < buf_sz ? g_stdin_len : buf_sz;
+
+	memcpy(out_buf, g_stdin_buf, n);
+	g_stdin_pos = n;
+	return (int)n;
+}
+
 __u64 hl_call_get_paging_budget(void)
 {
 	__u8 fc_buf[256];

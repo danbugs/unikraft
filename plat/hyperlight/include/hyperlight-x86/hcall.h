@@ -71,6 +71,32 @@ __u64 hl_call_get_exn_stack_top(void);
 int hl_call_get_cmdline(char *out_buf, __sz buf_sz);
 
 /**
+ * Call GetEnvVars() to retrieve host-provided environment variables.
+ *
+ * Returns a NUL-separated string of KEY=VALUE pairs.  The caller
+ * should split on '\0' and call putenv() for each entry.
+ *
+ * @param out_buf   Buffer to receive the NUL-separated string
+ * @param buf_sz    Size of out_buf
+ * @return          Total length of the returned data (including NULs),
+ *                  or -1 on error, or 0 if no env vars are set.
+ */
+int hl_call_get_env_vars(char *out_buf, __sz buf_sz);
+
+/**
+ * Call ReadStdin() to read bytes from the host's stdin buffer.
+ *
+ * Used by the console input driver.  The host returns up to
+ * @a buf_sz bytes from its stdin buffer; when the buffer is
+ * drained, returns 0 (EOF).
+ *
+ * @param out_buf   Buffer to receive stdin data
+ * @param buf_sz    Maximum bytes to read
+ * @return          Number of bytes read, or 0 on EOF/error.
+ */
+int hl_call_read_stdin(char *out_buf, __sz buf_sz);
+
+/**
  * Call GetPagingBudget() to query how many bytes the guest should
  * allocate from scratch for the paging frame allocator.
  *

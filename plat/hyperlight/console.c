@@ -21,15 +21,17 @@
  * The console transparently picks HostPrint when the hcall subsystem
  * is ready, falling back to DebugPrint otherwise.
  *
+ * Input uses the ReadStdin host function — the host maintains a
+ * byte buffer that the caller populates via GuestConfig::write_stdin().
+ * The console_in callback drains from that buffer; when it's empty
+ * the read returns 0 (EOF).
+ *
  * TODO: Route uk_pr_* output through port 99 (Log / OutBAction::Log)
  * instead of HostPrint (port 101).  Port 99 delivers a GuestLogData
  * FlatBuffer to the host's tracing framework, keeping kernel warnings
  * out of the HostPrint capture path (drain_output).  This requires
  * encoding GuestLogData FlatBuffers (level, source_file, line, source,
  * message) in the kernel — a different schema from hcall FlatBuffers.
- *
- * Hyperlight does not provide console input — the guest runs
- * non-interactively — so console_in always returns 0.
  */
 
 #include <uk/console/driver.h>
@@ -52,14 +54,32 @@ static __ssz hyperlight_console_out(struct uk_console *dev __unused,
 }
 
 /*
- * Hyperlight guests run non-interactively — the host invokes guest
- * functions, not the other way around — so there is no console input
- * channel.  Always return 0 (no bytes read).
+ * Console input via the ReadStdin host function.
+ *
+ * The host maintains a stdin buffer that the caller populates via
+ * GuestConfig::write_stdin().  Each call here drains up to @len
+ * bytes from that buffer.
+ *
+ * When the buffer is fully drained, we inject an EOT (Ctrl-D, 0x04)
+ * byte.  The serial TTY driver recognises EOT and clears POLLIN on
+ * the file, so the next read(2) returns 0 — the POSIX signal for
+ * end-of-file.  Without this, serial_read returns -EAGAIN and the
+ * caller busy-loops forever.
  */
 static __ssz hyperlight_console_in(struct uk_console *dev __unused,
-				   char *buf __unused, __sz len __unused)
+				   char *buf, __sz len)
 {
-	return 0;
+	int n;
+
+	if (!hl_hcall_ready())
+		return 0;
+
+	n = hl_call_read_stdin(buf, len);
+	if (n == 0 && len > 0) {
+		buf[0] = '\004'; /* EOT — triggers POLLIN clear */
+		return 1;
+	}
+	return (__ssz)n;
 }
 
 static struct uk_console_ops hyperlight_console_ops = {

@@ -99,6 +99,7 @@ static int hyperlight_dispatch_inject_env(struct uk_init_ctx *ictx __unused)
 {
 	static char env_cb[64];
 	static char env_entry[64];
+	static char env_getenv[64];
 
 	snprintf(env_cb, sizeof(env_cb), "HL_DISPATCH_CALLBACK_PTR=0x%lx",
 		 (unsigned long)&g_dispatch_callback);
@@ -108,10 +109,130 @@ static int hyperlight_dispatch_inject_env(struct uk_init_ctx *ictx __unused)
 		 (unsigned long)hyperlight_dispatch_function);
 	putenv(env_entry);
 
+	/*
+	 * Export the address of hl_call_get_env_vars so the loaded ELF
+	 * (driver) can call it directly.  The driver runs on glibc which
+	 * has a separate environ from the kernel; calling this function
+	 * is the only way to query host-provided env vars after boot.
+	 */
+	snprintf(env_getenv, sizeof(env_getenv),
+		 "HL_GET_ENV_VARS_FN=0x%lx",
+		 (unsigned long)hl_call_get_env_vars);
+	putenv(env_getenv);
+
 	return 0;
 }
 
 uk_late_initcall(hyperlight_dispatch_inject_env, 0x0);
+
+/* ── Host-provided environment variables ─────────────────────────── */
+
+/*
+ * Check whether a KEY=VALUE entry uses a reserved key prefix.
+ * Keys starting with "HL_" are reserved for Hyperlight internals
+ * (HL_DISPATCH_CALLBACK_PTR, HL_DISPATCH_ENTRY, etc.) and must not
+ * be overwritten by host-provided environment variables.
+ */
+static int is_reserved_env_key(const char *entry)
+{
+	return (entry[0] == 'H' && entry[1] == 'L' && entry[2] == '_');
+}
+
+/*
+ * Inject host-provided environment variables into the guest process.
+ *
+ * The host registers a GetEnvVars function that returns a NUL-separated
+ * string of KEY=VALUE pairs.  This init call queries that function and
+ * injects each pair via putenv().
+ *
+ * The buffer is static so putenv() pointers remain valid for the
+ * lifetime of the process.
+ *
+ * Keys starting with HL_ are silently skipped — they are reserved
+ * for Hyperlight internal use.
+ *
+ * Runs right after the dispatch env injection (priority 0x1) so both
+ * internal and host-provided env vars are set before main().
+ */
+static int hyperlight_dispatch_inject_host_env(struct uk_init_ctx *ictx __unused)
+{
+	static char env_buf[4096];
+	int len;
+	char *p, *end;
+
+	len = hl_call_get_env_vars(env_buf, sizeof(env_buf));
+	if (len <= 0)
+		return 0; /* no env vars from host — not an error */
+
+	p = env_buf;
+	end = env_buf + len;
+	while (p < end) {
+		if (*p == '\0') {
+			p++;
+			continue;
+		}
+		if (!is_reserved_env_key(p))
+			putenv(p);
+		p += strlen(p) + 1;
+	}
+
+	return 0;
+}
+
+uk_late_initcall(hyperlight_dispatch_inject_host_env, 0x1);
+
+/*
+ * Re-inject host-provided environment variables.
+ *
+ * Called at the start of every dispatch (hyperlight_dispatch_inner).
+ * On a normal boot this is a no-op (the initcall already ran and the
+ * host typically returns the same vars).  After a snapshot restore the
+ * initcall does NOT re-run, so this is the path that picks up env vars
+ * set by the host after restore.
+ *
+ * Uses setenv() instead of putenv() because the buffer is on the stack
+ * and must not outlive this call.  setenv() copies both key and value.
+ */
+static void hyperlight_dispatch_reinject_host_env(void)
+{
+	char buf[4096];
+	int len;
+	char *p, *end;
+
+	len = hl_call_get_env_vars(buf, sizeof(buf));
+	if (len <= 0)
+		return;
+
+	p = buf;
+	end = buf + len;
+	while (p < end) {
+		char *eq;
+
+		if (*p == '\0') {
+			p++;
+			continue;
+		}
+		if (is_reserved_env_key(p))
+			goto next;
+
+		eq = p;
+		while (*eq && *eq != '=')
+			eq++;
+		if (*eq == '=') {
+			*eq = '\0';
+			setenv(p, eq + 1, 1);
+			*eq = '=';
+		}
+next:
+		/* Advance past the NUL separator.  We may have
+		 * temporarily zeroed '=' above, but eq+1 points past
+		 * the value; find the original terminator.
+		 */
+		while (p < end && *p != '\0')
+			p++;
+		p++;
+	}
+}
 
 /*
  * Void FunctionCallResult — pre-encoded FlatBuffer.
@@ -208,6 +329,21 @@ hyperlight_dispatch_inner(void)
 		uk_pr_err("dispatch: not initialised\n");
 		goto push_result;
 	}
+
+	/*
+	 * Re-inject host-provided environment variables.
+	 *
+	 * On a normal boot this is redundant (the initcall already ran)
+	 * but cheap — one host call that returns an empty string.
+	 * After a snapshot restore the initcall does NOT re-run, so this
+	 * is the only path that picks up env vars the host set after
+	 * restore.
+	 *
+	 * Safe to call here: the GetEnvVars host call pushes/pops its
+	 * own frame on top of the input stack; the FunctionCall for this
+	 * dispatch remains below and is unaffected.
+	 */
+	hyperlight_dispatch_reinject_host_env();
 
 	/* Pop the FunctionCall from the input stack.
 	 * Copy immediately — the pointer is invalidated by any host call.
