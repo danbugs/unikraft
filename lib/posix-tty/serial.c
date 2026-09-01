@@ -121,13 +121,25 @@ static ssize_t serial_read(const struct uk_file *f,
 		if (*last == '\r')
 			*last = '\n';
 
+		/*
+		 * EOT (Ctrl-D) signals end-of-input.  Strip the EOT
+		 * byte from the returned data — real terminals do the
+		 * same — and clear POLLIN so the next read returns 0
+		 * (the POSIX EOF convention).
+		 */
+		if (*last == SERIAL_EOT) {
+			total--;
+			uk_file_event_clear(f, UKFD_POLLIN);
+			if (bytes_read > 1)
+				_console_out(buf, bytes_read - 1);
+			break;
+		}
+
 		/* Echo the input to the console (NOT stdout!) */
 		_console_out(buf, bytes_read);
 
 		if (*last == '\n')
 			break;
-		if (*last == SERIAL_EOT)
-			uk_file_event_clear(f, UKFD_POLLIN);
 	}
 
 	if (total || !uk_file_poll_immediate(f, UKFD_POLLIN))
