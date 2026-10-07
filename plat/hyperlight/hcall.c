@@ -181,51 +181,74 @@ static inline __s32 fb_i32(const __u8 *buf, __u64 off)
 }
 
 /*
- * Resolve vtable position for a table at `tbl`.
+ * Resolve vtable position for a table at `tbl`, or 0 if either lies
+ * outside the `len`-byte buffer.  The soffset is signed, so the
+ * position is computed signed: a bad one must not wrap into range.
  */
-static inline __u64 fb_vtable(const __u8 *buf, __u64 tbl)
+static inline __u64 fb_vtable(const __u8 *buf, __u64 len, __u64 tbl)
 {
-	return tbl - fb_i32(buf, tbl);
+	__s64 vt;
+
+	if (tbl + 4 > len)
+		return 0;
+	vt = (__s64)tbl - fb_i32(buf, tbl);
+	return vt > 0 && (__u64)vt + 4 <= len ? (__u64)vt : 0;
 }
 
 /*
  * Read field offset from vtable.  `vt_off` is the VT_* constant
- * (byte offset into vtable).  Returns 0 if the field is absent.
+ * (byte offset into vtable).  Returns 0 if the field is absent, and -1
+ * if the table, its vtable or the field lies outside the buffer.
  */
-static inline __u16 fb_field(const __u8 *buf, __u64 tbl, __u16 vt_off)
+static inline int fb_field(const __u8 *buf, __u64 len, __u64 tbl,
+			   __u16 vt_off)
 {
-	__u64 vt = fb_vtable(buf, tbl);
-	__u16 vt_size = fb_u16(buf, vt);
+	__u64 vt = fb_vtable(buf, len, tbl);
+	__u16 vt_size, foff;
 
+	if (!vt)
+		return -1;
+	vt_size = fb_u16(buf, vt);
 	if (vt_off >= vt_size)
 		return 0;
-	return fb_u16(buf, vt + vt_off);
+	if (vt + vt_off + 2 > len)
+		return -1;
+	foff = fb_u16(buf, vt + vt_off);
+	if (!foff)
+		return 0;
+	return tbl + foff < len ? foff : -1;
 }
 
 /*
- * Follow a uoffset field (string / sub-table) to its target.
+ * Follow a uoffset field (string / sub-table) to its target, or 0 if it
+ * is absent or points outside the buffer.
  */
-static inline __u64 fb_follow(const __u8 *buf, __u64 tbl, __u16 vt_off)
+static inline __u64 fb_follow(const __u8 *buf, __u64 len, __u64 tbl,
+			      __u16 vt_off)
 {
-	__u16 foff = fb_field(buf, tbl, vt_off);
+	int foff = fb_field(buf, len, tbl, vt_off);
+	__u64 field_pos, target;
 
-	if (foff == 0)
+	if (foff <= 0)
 		return 0;
 
-	__u64 field_pos = tbl + foff;
-
-	return field_pos + fb_u32(buf, field_pos);
+	field_pos = tbl + foff;
+	if (field_pos + 4 > len)
+		return 0;
+	target = field_pos + fb_u32(buf, field_pos);
+	return target + 4 <= len ? target : 0;
 }
 
 /*
  * Read a u8 scalar from a table, with a default for absent fields.
  */
-static inline __u8 fb_u8_default(const __u8 *buf, __u64 tbl,
+static inline __u8 fb_u8_default(const __u8 *buf, __u64 len, __u64 tbl,
 				 __u16 vt_off, __u8 defval)
 {
-	__u16 foff = fb_field(buf, tbl, vt_off);
+	int foff = fb_field(buf, len, tbl, vt_off);
 
-	if (foff == 0)
+	/* Out of bounds reads as the default too: every caller rejects it. */
+	if (foff <= 0)
 		return defval;
 	return buf[tbl + foff];
 }
@@ -448,31 +471,33 @@ static int fb_decode_result_string(const __u8 *buf, __u64 buf_len,
 	__u64 root = 4 + fb_u32(buf, 4);
 
 	/* FunctionCallResult.result_type must be ReturnValueBox (1) */
-	__u8 result_type = fb_u8_default(buf, root, VT_FCR_RESULT_TYPE, 0);
+	__u8 result_type = fb_u8_default(buf, buf_len, root,
+					 VT_FCR_RESULT_TYPE, 0);
 
 	if (result_type != HL_FCRT_RETURN_VALUE)
 		return -1;
 
 	/* Follow result → ReturnValueBox table */
-	__u64 rvb = fb_follow(buf, root, VT_FCR_RESULT);
+	__u64 rvb = fb_follow(buf, buf_len, root, VT_FCR_RESULT);
 
 	if (rvb == 0)
 		return -1;
 
 	/* ReturnValueBox.value_type must be hlstring (7) */
-	__u8 value_type = fb_u8_default(buf, rvb, VT_RVB_VALUE_TYPE, 0);
+	__u8 value_type = fb_u8_default(buf, buf_len, rvb,
+					VT_RVB_VALUE_TYPE, 0);
 
 	if (value_type != HL_RV_HLSTRING)
 		return -1;
 
 	/* Follow value → hlstring table */
-	__u64 hls = fb_follow(buf, rvb, VT_RVB_VALUE);
+	__u64 hls = fb_follow(buf, buf_len, rvb, VT_RVB_VALUE);
 
 	if (hls == 0)
 		return -1;
 
 	/* Follow hlstring.value → string */
-	__u64 str = fb_follow(buf, hls, VT_HLS_VALUE);
+	__u64 str = fb_follow(buf, buf_len, hls, VT_HLS_VALUE);
 
 	if (str == 0)
 		return -1;
@@ -506,33 +531,35 @@ static int fb_decode_result_ulong(const __u8 *buf, __u64 buf_len,
 	__u64 root = 4 + fb_u32(buf, 4);
 
 	/* FunctionCallResult.result_type must be ReturnValueBox (1) */
-	__u8 result_type = fb_u8_default(buf, root, VT_FCR_RESULT_TYPE, 0);
+	__u8 result_type = fb_u8_default(buf, buf_len, root,
+					 VT_FCR_RESULT_TYPE, 0);
 
 	if (result_type != HL_FCRT_RETURN_VALUE)
 		return -1;
 
 	/* Follow result → ReturnValueBox table */
-	__u64 rvb = fb_follow(buf, root, VT_FCR_RESULT);
+	__u64 rvb = fb_follow(buf, buf_len, root, VT_FCR_RESULT);
 
 	if (rvb == 0)
 		return -1;
 
 	/* ReturnValueBox.value_type must be hlulong (4) */
-	__u8 value_type = fb_u8_default(buf, rvb, VT_RVB_VALUE_TYPE, 0);
+	__u8 value_type = fb_u8_default(buf, buf_len, rvb,
+					VT_RVB_VALUE_TYPE, 0);
 
 	if (value_type != HL_RV_HLULONG)
 		return -1;
 
 	/* Follow value → hlulong table */
-	__u64 hlu = fb_follow(buf, rvb, VT_RVB_VALUE);
+	__u64 hlu = fb_follow(buf, buf_len, rvb, VT_RVB_VALUE);
 
 	if (hlu == 0)
 		return -1;
 
 	/* hlulong.value: u64 at VT offset 4 */
-	__u16 foff = fb_field(buf, hlu, VT_HLS_VALUE);
+	int foff = fb_field(buf, buf_len, hlu, VT_HLS_VALUE);
 
-	if (foff == 0)
+	if (foff <= 0 || hlu + foff + sizeof(__u64) > buf_len)
 		return -1;
 
 	memcpy(out_val, buf + hlu + foff, sizeof(__u64));
@@ -1237,28 +1264,33 @@ static int fb_decode_result_int(const __u8 *buf, __u64 buf_len,
 
 	__u64 root = 4 + fb_u32(buf, 4);
 
-	if (fb_u8_default(buf, root, VT_FCR_RESULT_TYPE, 0)
+	if (fb_u8_default(buf, buf_len, root, VT_FCR_RESULT_TYPE, 0)
 	    != HL_FCRT_RETURN_VALUE)
 		return -1;
 
-	__u64 rvb = fb_follow(buf, root, VT_FCR_RESULT);
+	__u64 rvb = fb_follow(buf, buf_len, root, VT_FCR_RESULT);
 
 	if (!rvb)
 		return -1;
 
-	if (fb_u8_default(buf, rvb, VT_RVB_VALUE_TYPE, 0) != HL_RV_HLINT)
+	if (fb_u8_default(buf, buf_len, rvb, VT_RVB_VALUE_TYPE, 0)
+	    != HL_RV_HLINT)
 		return -1;
 
-	__u64 hli = fb_follow(buf, rvb, VT_RVB_VALUE);
+	__u64 hli = fb_follow(buf, buf_len, rvb, VT_RVB_VALUE);
 
 	if (!hli)
 		return -1;
 
-	__u16 foff = fb_field(buf, hli, VT_HLS_VALUE);
+	int foff = fb_field(buf, buf_len, hli, VT_HLS_VALUE);
 
-	if (!foff) {
+	if (foff < 0) {
+		return -1;
+	} else if (!foff) {
 		/* Field absent → value is the FlatBuffer default (0). */
 		*out_val = 0;
+	} else if (hli + foff + sizeof(__s32) > buf_len) {
+		return -1;
 	} else {
 		*out_val = fb_i32(buf, hli + foff);
 	}
@@ -1275,31 +1307,39 @@ static int fb_decode_result_vecbytes(const __u8 *buf, __u64 buf_len,
 
 	__u64 root = 4 + fb_u32(buf, 4);
 
-	if (fb_u8_default(buf, root, VT_FCR_RESULT_TYPE, 0)
+	if (fb_u8_default(buf, buf_len, root, VT_FCR_RESULT_TYPE, 0)
 	    != HL_FCRT_RETURN_VALUE)
 		return -1;
 
-	__u64 rvb = fb_follow(buf, root, VT_FCR_RESULT);
+	__u64 rvb = fb_follow(buf, buf_len, root, VT_FCR_RESULT);
 
 	if (!rvb)
 		return -1;
 
-	if (fb_u8_default(buf, rvb, VT_RVB_VALUE_TYPE, 0)
+	if (fb_u8_default(buf, buf_len, rvb, VT_RVB_VALUE_TYPE, 0)
 	    != HL_RV_HLSIZEPREFIXED)
 		return -1;
 
-	__u64 spb = fb_follow(buf, rvb, VT_RVB_VALUE);
+	__u64 spb = fb_follow(buf, buf_len, rvb, VT_RVB_VALUE);
 
 	if (!spb)
 		return -1;
 
-	__u64 vec = fb_follow(buf, spb, VT_SPB_VALUE);
+	/* An absent vector is an empty result; one outside buf is not. */
+	int vfield = fb_field(buf, buf_len, spb, VT_SPB_VALUE);
 
-	if (!vec) {
+	if (vfield < 0)
+		return -1;
+	if (!vfield) {
 		*out_data = NULL;
 		*out_len = 0;
 		return 0;
 	}
+
+	__u64 vec = fb_follow(buf, buf_len, spb, VT_SPB_VALUE);
+
+	if (!vec)
+		return -1;
 
 	__u32 vlen = fb_u32(buf, vec);
 

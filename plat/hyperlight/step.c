@@ -225,6 +225,17 @@ static inline __u16 fb_u16(const __u8 *b, __u64 o)
 	return b[o] | ((__u16)b[o + 1] << 8);
 }
 
+/* Where the vtable of the table at @tbl lies in @b (tbl - its soffset),
+ * or 0 if outside @b: a soffset is signed, and one past either end of the
+ * buffer would otherwise wrap.
+ */
+static __u64 fb_vtable(const __u8 *b, __u64 len, __u64 tbl)
+{
+	__s64 vt = (__s64)tbl - (__s32)fb_u32(b, tbl);
+
+	return vt > 0 && (__u64)vt < len ? (__u64)vt : 0;
+}
+
 /* True if the size-prefixed FunctionCall in @b is named @name. */
 static int fc_name_is(const __u8 *b, __u64 len, const char *name)
 {
@@ -237,8 +248,8 @@ static int fc_name_is(const __u8 *b, __u64 len, const char *name)
 	if (root + 4 > len)
 		return 0;
 	/* vtable is at root - soffset; function_name is vtable slot 4. */
-	vt = root - (__s32)fb_u32(b, root);
-	if (vt + 6 > len)
+	vt = fb_vtable(b, len, root);
+	if (!vt || vt + 6 > len)
 		return 0;
 	vsize = fb_u16(b, vt);
 	if (vsize < 6)
@@ -260,23 +271,40 @@ static int fc_name_is(const __u8 *b, __u64 len, const char *name)
 }
 
 /* Where field @vtoff (a vtable byte offset: 4 is the first field) of the
- * table at @tbl lies in @b, or 0 if absent or out of bounds.
+ * table at @tbl lies in @b, in *@pos: 1 if present, 0 if absent, -1 if
+ * the table, its vtable or the field lies outside @b.
  */
-static __u64 fb_field_at(const __u8 *b, __u64 len, __u64 tbl, __u16 vtoff)
+static int fb_field_pos(const __u8 *b, __u64 len, __u64 tbl, __u16 vtoff,
+			__u64 *pos)
 {
 	__u64 vt;
 	__u16 vsize, off;
 
 	if (tbl + 4 > len)
-		return 0;
-	vt = tbl - (__s32)fb_u32(b, tbl);
-	if (vt + 4 > len)
-		return 0;
+		return -1;
+	vt = fb_vtable(b, len, tbl);
+	if (!vt || vt + 4 > len)
+		return -1;
 	vsize = fb_u16(b, vt);
-	if (vtoff + 2 > vsize || vt + vtoff + 2 > len)
+	if (vtoff + 2 > vsize)
 		return 0;
+	if (vt + vtoff + 2 > len)
+		return -1;
 	off = fb_u16(b, vt + vtoff);
-	return off && tbl + off < len ? tbl + off : 0;
+	if (!off)
+		return 0;
+	if (tbl + off >= len)
+		return -1;
+	*pos = tbl + off;
+	return 1;
+}
+
+/* The position fb_field_pos() finds, or 0 if absent or out of bounds. */
+static __u64 fb_field_at(const __u8 *b, __u64 len, __u64 tbl, __u16 vtoff)
+{
+	__u64 pos;
+
+	return fb_field_pos(b, len, tbl, vtoff, &pos) > 0 ? pos : 0;
 }
 
 /* The table a uoffset at @pos points to, or 0. */
@@ -348,11 +376,13 @@ static int fc_param_bytes(const __u8 *b, __u64 len, __u32 idx,
 	if (!value)
 		return -1;
 	/* hlvecbytes.value: a [ubyte], absent when empty. */
-	field = fb_field_at(b, len, value, 4);
-	if (!field) {
+	switch (fb_field_pos(b, len, value, 4, &field)) {
+	case 0:
 		*out = b;
 		*out_len = 0;
 		return 0;
+	case -1:
+		return -1;
 	}
 	vec = fb_deref(b, len, field);
 	if (!vec)
