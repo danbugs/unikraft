@@ -350,51 +350,10 @@ hyperlight_dispatch_prefault(void)
 #endif
 }
 
-/* The SYSCALL MSRs and the dispatch entry are x86's; the arm64 entry is
+/* The dispatch entry is x86's; the arm64 entry is
  * in arm/entry64.S.
  */
 #if defined(__x86_64__)
-/* ── SYSCALL MSR fixup ─────────────────────────────────────────── */
-
-/*
- * Re-program SYSCALL MSRs after snapshot restore.
- *
- * Hyperlight's snapshot/restore preserves segment registers and
- * control registers (via CommonSpecialRegisters) but does NOT
- * save or restore the declared guest MSRs (LSTAR, STAR,
- * SYSCALL_MASK) — they are reset to their baseline (0) on restore.
- * The standard Hyperlight guest uses OUT/HLT instead of SYSCALL, so
- * this was never needed.  Unikraft programs these MSRs during boot
- * (setup.c) to support ring-3 ELFs via elfloader.  After
- * snapshot/restore they are 0, causing any SYSCALL to jump to RIP=0.
- *
- * EFER is NOT re-programmed here: hyperlight restores it (with SCE)
- * as part of the special-register state, and it cannot be written by
- * the guest under the 0.17.0 default-deny MSR filter — see setup.c.
- *
- * Called from the snapshot fixup path in hyperlight_dispatch_function.
- */
-#ifdef CONFIG_HAVE_SYSCALL
-extern void _ukplat_syscall(void);
-#endif
-
-void __attribute__((used))
-hyperlight_dispatch_fixup_syscall(void)
-{
-#ifdef CONFIG_HAVE_SYSCALL
-	uk_arch_x86_64_wrmsrl(UK_ARCH_X86_64_MSR_STAR,
-		(0x08ULL << 48) | (0x08ULL << 32));
-	uk_arch_x86_64_wrmsrl(UK_ARCH_X86_64_MSR_LSTAR,
-		(__uptr)_ukplat_syscall);
-	uk_arch_x86_64_wrmsrl(UK_ARCH_X86_64_MSR_SYSCALL_MASK,
-		UK_ARCH_X86_64_RFLAGS_TF |
-		UK_ARCH_X86_64_RFLAGS_DF |
-		UK_ARCH_X86_64_RFLAGS_IF |
-		UK_ARCH_X86_64_RFLAGS_AC |
-		UK_ARCH_X86_64_RFLAGS_NT);
-#endif
-}
-
 /* ── Dispatch entry point ───────────────────────────────────────── */
 
 /*
@@ -520,12 +479,6 @@ hyperlight_dispatch_function(void)
 
 		/* Pop temp IDT (240) + saved IDTR (16). */
 		"addq $256, %%rsp\n\t"
-
-		/*
-		 * Re-program SYSCALL MSRs (LSTAR, STAR, SYSCALL_MASK).
-		 * Hyperlight does not save/restore MSRs across snapshots.
-		 */
-		"callq hyperlight_dispatch_fixup_syscall\n\t"
 
 		/*
 		 * Re-initialise the paging frame allocator.

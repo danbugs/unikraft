@@ -172,7 +172,10 @@ static void _ukplat_entry(struct ukplat_bootinfo *bi)
 	 * declares via SandboxConfiguration::guest_msrs(); EFER cannot be
 	 * declared (it is sregs state, not a resettable MSR), so a guest
 	 * rdmsr/wrmsr of it faults with #GP.  STAR/LSTAR/SYSCALL_MASK are
-	 * declared by the host and remain writable here.
+	 * declared by the host and remain writable here.  Being declared,
+	 * they are also saved with a snapshot and written back on restore,
+	 * so a restored guest does not program them again: on a nested
+	 * hypervisor each wrmsr is an exit of several microseconds.
 	 */
 	{
 		extern void _ukplat_syscall(void);
