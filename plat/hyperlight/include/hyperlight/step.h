@@ -48,9 +48,11 @@
  *                  on it and runs each call on its own schedulable
  *                  thread.  Re-entering read() marks the call complete.
  *
- * The guest reports to the host through named host functions, each one
- * fact with typed arguments: Yield(ns, flags, status, result) at every
- * boundary, carrying what the entry saw of the call in flight,
+ * Every entry ends with a Yield(ns, flags, status, result): the next
+ * timer, and what the entry saw of the call in flight.  It comes back as
+ * the guest function's result (a Vec<u8>), or as a Yield host call at
+ * boot complete, which is no entry.  The guest also reports through
+ * named host functions, each one fact with typed arguments:
  * DriverReady() and CallRejected() (see step.c), plus
  * Exited(status) from the shutdown path of every kernel on this platform
  * (shutdown.c).  A halt with neither a Yield nor an Exited means the
@@ -142,18 +144,34 @@ struct hlcall_hostcall {
 
 #if CONFIG_HYPERLIGHT_STEP
 
+/** The Yield an entry ends with. */
+struct hl_step_yield {
+	/* The next timer fires in ns (0: none). */
+	__u64 ns;
+	/* HL_YIELD_* (step.c). */
+	__s32 flags;
+	/* The call's status, with HL_YIELD_DONE. */
+	__s32 status;
+	/* What the call returned, if anything. */
+	const __u8 *result;
+	__u64 result_len;
+};
+
 /**
  * Run one cooperative step: dispose of the in-flight FunctionCall, drive
- * the scheduler until it would go idle, then report the next-wakeup
- * deadline to the host via the `Yield` host function and return so the
- * dispatch handler can push the void result and halt.
+ * the scheduler until it would go idle, and fill @y with the boundary's
+ * Yield for the dispatch handler to return as the entry's result.
  *
  * @param fc      The FunctionCall FlatBuffer that entered the guest
  *                (a stable copy; the PEB input stack is reused by host
  *                calls made while the scheduler runs).
  * @param fc_len  Length of @fc.
+ * @param y       Where the Yield goes.
+ * @return 1 if @y holds a Yield, 0 if the entry ends without one (there
+ *         was nothing to drive).
  */
-void hyperlight_step_pump(const __u8 *fc, __u64 fc_len);
+int hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
+			struct hl_step_yield *y);
 
 /**
  * Platform halt hook.
@@ -195,6 +213,9 @@ __u64 hyperlight_step_fc_env_version(const __u8 *fc, __u64 fc_len);
 
 /** True if @fc is the host's `resume` entry. */
 int hyperlight_step_fc_is_resume(const __u8 *fc, __u64 fc_len);
+
+/** The host has the last Yield: forget what it reported. */
+void hyperlight_step_yield_delivered(void);
 
 /**
  * Report the call in flight's start or return on its own host call, for a

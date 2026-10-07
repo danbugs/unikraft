@@ -57,6 +57,12 @@ __u64 hl_hcall_max_payload(void);
  */
 int hl_stack_push(volatile __u8 *stack, __u64 stack_size,
 		  const __u8 *data, __u64 data_len);
+/* Where an element of @data_len bytes goes on top of @stack, for writing
+ * it in place, or NULL if it does not fit.  hl_stack_commit() pushes it.
+ */
+volatile __u8 *hl_stack_reserve(volatile __u8 *stack, __u64 stack_size,
+				__u64 data_len);
+void hl_stack_commit(volatile __u8 *stack, __u64 data_len);
 int hl_stack_pop(volatile __u8 *stack,
 		 const __u8 **out_data, __u64 *out_len);
 

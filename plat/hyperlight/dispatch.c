@@ -14,8 +14,9 @@
  * vCPU.
  *
  * The dispatch handler pops the FunctionCall from the input stack,
- * hands it to the cooperative step pump (step.c), pushes a void result
- * onto the output stack, and halts via port 108.
+ * hands it to the cooperative step pump (step.c), pushes the entry's
+ * Yield as its Vec<u8> result onto the output stack, and halts via port
+ * 108.
  *
  * The pump is the sole consumer of guest function calls: it
  * runs the scheduler until it would go idle and hands the vCPU back with
@@ -142,19 +143,6 @@ static int hyperlight_dispatch_env_init(struct uk_init_ctx *ictx __unused)
 }
 uk_late_initcall(hyperlight_dispatch_env_init, 0x0);
 
-/*
- * Void FunctionCallResult — pre-encoded FlatBuffer.
- * Matches hyperlight-common 0.16.0.
- */
-static const __u8 HL_VOID_RESULT[] = {
-	0x2c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
-	0xf4, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
-	0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00,
-	0x07, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x09, 0x08, 0x00, 0x00, 0x00,
-	0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00, 0x00,
-};
-
 /* ── Call size ─────────────────────────────────────────────────── */
 
 /*
@@ -189,15 +177,65 @@ void hyperlight_dispatch_init(const struct hyperlight_peb *peb)
 
 /* ── Dispatch inner ─────────────────────────────────────────────── */
 
-/* Push the pre-encoded void FunctionCallResult onto the output stack.
- * Also used by the shutdown path when a step pump is in flight, so the
- * host's in-progress `step` call completes normally when the guest
- * process exits.
+/* The FunctionCallResult hyperlight_dispatch_push_bytes_result() writes,
+ * pre-encoded up to the vector's bytes (hyperlight-common 0.17): the root
+ * table, a ReturnValueBox sharing its vtable, a ReturnValue of type
+ * hlsizeprefixedbuffer (10), and that table, whose size and vector
+ * length are patched in.  Every guest function returns a Vec<u8>.
  */
-void hyperlight_dispatch_push_void_result(void)
+static const __u8 HL_BYTES_RESULT[] = {
+	0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, /* size; root at 8 */
+	0xf4, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, /* vtable 20; box */
+	0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, /* box at 28; vtable */
+	0x07, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, /* ...; box: vtable at 20 */
+	0x00, 0x00, 0x00, 0x0a, 0x0c, 0x00, 0x00, 0x00, /* bytes table at 48 */
+	0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, /* its vtable: size, value */
+	0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* vtable at 40; size */
+	0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* vector at 60; length */
+};
+
+static void hl_put_le32(volatile __u8 *p, __u32 v)
 {
-	hl_stack_push(g_output_stack, g_output_stack_size,
-		      HL_VOID_RESULT, sizeof(HL_VOID_RESULT));
+	p[0] = v;
+	p[1] = v >> 8;
+	p[2] = v >> 16;
+	p[3] = v >> 24;
+}
+
+/* Push a FunctionCallResult that returns @a followed by @b as one
+ * Vec<u8>, written in place on the output stack.  -1 if it does not fit.
+ */
+static int hyperlight_dispatch_push_bytes_result(const __u8 *a, __u64 alen,
+						 const __u8 *b, __u64 blen)
+{
+	__u64 n = alen + blen;
+	__u64 total = sizeof(HL_BYTES_RESULT) + ((n + 3) & ~3ULL);
+	volatile __u8 *p = hl_stack_reserve(g_output_stack,
+					    g_output_stack_size, total);
+
+	if (!p)
+		return -1;
+	memcpy((void *)p, HL_BYTES_RESULT, sizeof(HL_BYTES_RESULT));
+	hl_put_le32(p, (__u32)(total - 4));
+	hl_put_le32(p + 52, (__u32)n);
+	hl_put_le32(p + 60, (__u32)n);
+	if (alen)
+		memcpy((void *)(p + 64), a, alen);
+	if (blen)
+		memcpy((void *)(p + 64 + alen), b, blen);
+	for (__u64 i = 64 + n; i < total; i++)
+		p[i] = 0;
+	hl_stack_commit(g_output_stack, total);
+	return 0;
+}
+
+/* An empty result: the entry ends without a Yield of its own.  Also
+ * pushed by the shutdown path when a step pump is in flight, so the
+ * host's entry completes normally when the guest process exits.
+ */
+void hyperlight_dispatch_push_empty_result(void)
+{
+	hyperlight_dispatch_push_bytes_result(NULL, 0, NULL, 0);
 }
 
 void __attribute__((used))
@@ -267,7 +305,33 @@ hyperlight_dispatch_inner(void)
 		hyperlight_dispatch_apply_host_env_version(
 			hyperlight_step_fc_env_version(fc_buf, fc_len));
 
-	hyperlight_step_pump(fc_buf, fc_len);
+	{
+		struct hl_step_yield y;
+		__u8 rec[16];
+
+		if (hyperlight_step_pump(fc_buf, fc_len, &y)) {
+			/* The Yield comes back as the entry's result, with no
+			 * exit of its own: the next wakeup, the flags and the
+			 * status, little-endian, then the call's result.
+			 */
+			hl_put_le32(rec, (__u32)y.ns);
+			hl_put_le32(rec + 4, (__u32)(y.ns >> 32));
+			hl_put_le32(rec + 8, (__u32)y.flags);
+			hl_put_le32(rec + 12, (__u32)y.status);
+			if (hyperlight_dispatch_push_bytes_result(
+				    rec, sizeof(rec), y.result,
+				    y.result_len) == 0) {
+				hyperlight_step_yield_delivered();
+				return;
+			}
+			/* Cannot happen: a result is at most
+			 * hl_hcall_max_payload(), which leaves room for it on
+			 * the empty output stack.  Were it to, the host would
+			 * see an entry without a Yield.
+			 */
+			uk_pr_err("dispatch: no room for the entry's Yield\n");
+		}
+	}
 #else /* !CONFIG_HYPERLIGHT_STEP */
 	hyperlight_dispatch_apply_host_env();
 	/* No scheduler, so nothing can serve a guest function: the workload
@@ -278,7 +342,8 @@ hyperlight_dispatch_inner(void)
 #endif /* !CONFIG_HYPERLIGHT_STEP */
 
 push_result:
-	hyperlight_dispatch_push_void_result();
+	/* Every entry returns bytes; none means it kept no Yield. */
+	hyperlight_dispatch_push_empty_result();
 }
 
 /* ── Snapshot pre-fault ─────────────────────────────────────────── */

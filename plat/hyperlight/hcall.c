@@ -103,19 +103,35 @@ __u64 hl_hcall_max_payload(void)
  * Pop reads back_ptr at (stack_ptr - 8), rewinds stack_ptr to it.
  */
 
-int hl_stack_push(volatile __u8 *stack, __u64 stack_size,
-		  const __u8 *data, __u64 data_len)
+volatile __u8 *hl_stack_reserve(volatile __u8 *stack, __u64 stack_size,
+				__u64 data_len)
+{
+	__u64 old_sp = *(volatile __u64 *)stack;
+
+	/* data + back_ptr */
+	if (old_sp + data_len + 8 > stack_size)
+		return NULL;
+	return stack + old_sp;
+}
+
+void hl_stack_commit(volatile __u8 *stack, __u64 data_len)
 {
 	volatile __u64 *sp = (volatile __u64 *)stack;
 	__u64 old_sp = *sp;
-	__u64 needed = data_len + 8; /* data + back_ptr */
 
-	if (old_sp + needed > stack_size)
-		return -1;
-
-	memcpy((void *)(stack + old_sp), data, data_len);
 	*(volatile __u64 *)(stack + old_sp + data_len) = old_sp;
 	*sp = old_sp + data_len + 8;
+}
+
+int hl_stack_push(volatile __u8 *stack, __u64 stack_size,
+		  const __u8 *data, __u64 data_len)
+{
+	volatile __u8 *p = hl_stack_reserve(stack, stack_size, data_len);
+
+	if (!p)
+		return -1;
+	memcpy((void *)p, data, data_len);
+	hl_stack_commit(stack, data_len);
 	return 0;
 }
 

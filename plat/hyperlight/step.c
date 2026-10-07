@@ -68,18 +68,27 @@ extern void hostsock_resume(void);
  */
 #define HL_STEP_DUE_NS 1ULL
 
-/* What the guest tells the host, each as a named host function: the
- * protocol is the names and their typed arguments, nothing is encoded.
+/* What the guest tells the host.  An entry ends with its Yield, returned
+ * as the guest function's result, a Vec<u8>: the next wakeup in ns (u64,
+ * 0: no timer), the flags and the call's status (i32 each), little-endian,
+ * then the call's result.  At boot complete, which is no entry, the
+ * Yield goes as the host function of the same name.
  *
  *   Yield(ns, flags, status, result)
- *                     every thread is blocked; the next timer fires in ns
- *                     (0: none).  Sent at every boundary, and once at boot
- *                     complete.  It also carries what the entry saw of the
- *                     call in flight, so a call costs no exit of its own:
- *                     HL_YIELD_STARTED, the reader took the call and it
- *                     is still running; HL_YIELD_DONE, it returned, with
- *                     status (0, or what the driver wrote to the device)
- *                     and result (what it returned; empty: nothing).
+ *                     every thread is blocked; the next timer fires in ns.
+ *                     It also carries what the entry saw of the call in
+ *                     flight, so a call costs no exit of its own:
+ *                     HL_YIELD_STARTED, the reader took the call;
+ *                     HL_YIELD_DONE, it returned (both can be set: it
+ *                     started and returned in this entry), with status (0,
+ *                     or what the driver wrote to the device) and result
+ *                     (what it returned; empty: nothing);
+ *                     HL_YIELD_READY, a driver serves named calls, for a
+ *                     host that has not heard DriverReady (after a
+ *                     restore, see hl_resume()).
+ *
+ * The rest are named host functions, one fact each:
+ *
  *   DriverReady()     /dev/hlcall was opened: named calls are served.
  *   CallStarted()     the reader took a named call; sent on its own only
  *                     when no Yield follows (hyperlight_step_flush()).
@@ -91,10 +100,8 @@ extern void hostsock_resume(void);
  * Exited(status), the process exit, is not the step model's: every
  * kernel on this platform sends it from the shutdown path (shutdown.c).
  *
- * After a restore, DriverReady and CallStarted are sent again if they
- * hold, so the new host learns them (see hl_resume()).  Every send is
- * best-effort: a host lacking one of these functions does not learn that
- * fact, and nothing else breaks.
+ * Every send is best-effort: a host lacking one of these functions does
+ * not learn that fact, and nothing else breaks.
  */
 static void hl_emit(const char *event)
 {
@@ -118,6 +125,7 @@ static void hl_emit_done(__s32 status, const __u8 *buf, __u64 len)
 
 #define HL_YIELD_STARTED 1
 #define HL_YIELD_DONE    2
+#define HL_YIELD_READY   4
 
 /* What the entry saw of the call in flight, for its Yield. */
 static int hl_start_pending;
@@ -137,31 +145,63 @@ static void hl_step_forget_pending(void)
 	hl_start_pending = 0;
 }
 
-/* A boundary: every thread is blocked and the next timer fires in @ns
- * (0: none), with what this entry saw of the call in flight.  The call's
- * start is reported only if it is still running: a return implies it.
+/* A driver holds /dev/hlcall open, for the next Yield to tell a host
+ * that has not heard it (the first entry after a restore).
  */
-static void hl_emit_yield(__u64 ns)
+static int hl_ready_pending;
+
+/* The Yield for a boundary: the next timer fires in @ns (0: none), with
+ * what this entry saw of the call in flight -- it started, it returned
+ * (with its status and result) -- and whether a driver is ready.  Nothing
+ * is forgotten until the host has it (hyperlight_step_yield_delivered()).
+ */
+static void hl_yield_record(__u64 ns, struct hl_step_yield *y)
+{
+	y->ns = ns;
+	y->flags = 0;
+	if (hl_done_pending)
+		y->flags |= HL_YIELD_DONE;
+	if (hl_start_pending)
+		y->flags |= HL_YIELD_STARTED;
+	if (hl_ready_pending)
+		y->flags |= HL_YIELD_READY;
+	y->status = hl_done_pending ? hl_call_fail_status : 0;
+	y->result = hl_done_pending && hl_result_len ? hl_result_buf : NULL;
+	y->result_len = hl_done_pending ? hl_result_len : 0;
+}
+
+/* Send @y with the Yield host call. */
+static void hl_send_yield(const struct hl_step_yield *y)
 {
 	struct hl_param p[4];
-	__s32 out, flags = 0;
-
-	if (hl_done_pending)
-		flags = HL_YIELD_DONE;
-	else if (hl_start_pending)
-		flags = HL_YIELD_STARTED;
+	__s32 out;
 
 	p[0].type = HL_PV_HLULONG;
-	p[0].u64_val = ns;
+	p[0].u64_val = y->ns;
 	p[1].type = HL_PV_HLINT;
-	p[1].i32_val = flags;
+	p[1].i32_val = y->flags;
 	p[2].type = HL_PV_HLINT;
-	p[2].i32_val = hl_done_pending ? hl_call_fail_status : 0;
+	p[2].i32_val = y->status;
 	p[3].type = HL_PV_HLVECBYTES;
-	p[3].vec.ptr = hl_done_pending && hl_result_len ? hl_result_buf : (const __u8 *)"";
-	p[3].vec.len = hl_done_pending ? (__u32)hl_result_len : 0;
+	p[3].vec.ptr = y->result ? y->result : (const __u8 *)"";
+	p[3].vec.len = (__u32)y->result_len;
 	(void)hl_hcall_int("Yield", p, 4, &out);
+}
+
+void hyperlight_step_yield_delivered(void)
+{
 	hl_step_forget_pending();
+	hl_ready_pending = 0;
+}
+
+/* A boundary outside an entry (boot complete): send its Yield. */
+static void hl_emit_yield(__u64 ns)
+{
+	struct hl_step_yield y;
+
+	hl_yield_record(ns, &y);
+	hl_send_yield(&y);
+	hyperlight_step_yield_delivered();
 }
 
 /* The guest function that drives the scheduler, and the one the host
@@ -332,7 +372,7 @@ static __u64 hl_call_cap;
 static __u64 hl_call_len;              /* 0 = nothing queued */
 static struct uk_thread *hl_call_reader; /* thread blocked in read() */
 static int hl_call_opened;             /* a driver has opened the device */
-static __u64 hl_result_cap;            /* hl_hcall_max_payload(): what CallDone carries */
+static __u64 hl_result_cap;            /* hl_hcall_max_payload(): a result's most */
 static __u8 *hl_reply_buf;             /* a HostCall reply, hl_call_cap bytes */
 static __u8 *hl_args_buf;              /* a HostCall's name and args, hl_hcall_max_payload() */
 
@@ -466,7 +506,7 @@ static int hlcall_read(struct device *dev __unused, struct uio *uio,
 	buf = uio->uio_iov->iov_base;
 	cap = uio->uio_iov->iov_len;
 
-	/* Reported with the entry's Yield (hl_emit_yield()). */
+	/* Reported with the entry's Yield (hl_yield_record()). */
 	if (hl_call_in_flight) {
 		hl_call_in_flight = 0;
 		hl_done_pending = 1;
@@ -492,9 +532,9 @@ static int hlcall_read(struct device *dev __unused, struct uio *uio,
 /* The driver reports how the call it is serving went: a 32-bit status,
  * 0 for success, optionally followed by what the call returned.  Written
  * before the next read(), which reports the call done with the status
- * and the result, one host call (CallDone).  The kernel
- * interprets neither.  A result travels as a host call's parameter, so it
- * is at most hl_hcall_max_payload() bytes; a larger one is refused
+ * and the result on the entry's Yield.  The kernel interprets neither.
+ * A result is at most hl_hcall_max_payload() bytes, what a host call's
+ * parameter holds, so it also fits the Yield; a larger one is refused
  * (EMSGSIZE) rather than lost on the way.
  */
 static int hlcall_write(struct device *dev __unused, struct uio *uio,
@@ -889,11 +929,13 @@ static void hl_resume(void)
 		hyperlight_time_resync();
 		hyperlight_resolv_apply();
 	}
-	/* The new host has not heard these yet. */
+	/* The new host has not heard these yet; they ride on the entry's
+	 * Yield.
+	 */
 	if (hl_call_opened)
-		hl_emit("DriverReady");
+		hl_ready_pending = 1;
 	if (hl_call_in_flight)
-		hl_emit("CallStarted");
+		hl_start_pending = 1;
 }
 
 int hyperlight_step_active(void)
@@ -936,7 +978,8 @@ int hyperlight_step_halt(__nsec wakeup_time)
 	return 0;
 }
 
-void hyperlight_step_pump(const __u8 *fc, __u64 fc_len)
+int hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
+			struct hl_step_yield *y)
 {
 	struct uk_sched *s = uk_sched_current();
 	struct uk_thread *idle;
@@ -958,7 +1001,7 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len)
 		 */
 		uk_pr_warn("hyperlight: step pump entered without a "
 			   "schedulable guest\n");
-		return;
+		return 0;
 	}
 
 	if (fc_name_is(fc, fc_len, hl_resume_fn_name))
@@ -1001,7 +1044,8 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len)
 	hl_pump_idle = NULL;
 	hl_pump_wakeup = 0;
 
-	hl_emit_yield(hl_ns_until(wakeup));
+	hl_yield_record(hl_ns_until(wakeup), y);
+	return 1;
 }
 
 /* Report the call's start or return on its own: for a path that ends the
@@ -1009,6 +1053,9 @@ void hyperlight_step_pump(const __u8 *fc, __u64 fc_len)
  */
 void hyperlight_step_flush(void)
 {
+	if (hl_ready_pending)
+		hl_emit("DriverReady");
+	hl_ready_pending = 0;
 	if (hl_done_pending)
 		hl_emit_done(hl_call_fail_status, hl_result_buf, hl_result_len);
 	else if (hl_start_pending)

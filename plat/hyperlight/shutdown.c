@@ -35,7 +35,7 @@ extern int hostsock_rescan_events(void);
 /* Provided by dispatch.c */
 extern void hyperlight_dispatch_function(void)
 	__attribute__((noreturn));
-extern void hyperlight_dispatch_push_void_result(void);
+extern void hyperlight_dispatch_push_empty_result(void);
 
 /*
  * Halt via port 108.  The host intercepts this VM exit.
@@ -139,14 +139,14 @@ static int hyperlight_shutdown(void)
 	/*
 	 * Under a step pump this halt lands in the middle of the host's
 	 * `step` call (the workload's main thread exited and ukboot is
-	 * shutting the system down): complete that call with a void result
+	 * shutting the system down): complete that call with an empty result
 	 * too, so the host reads a clean exit rather than a truncated step.
 	 * The report goes first; it is a host call and must not sit on top
 	 * of the result.
 	 */
 	hyperlight_report_exit();
 	if (hyperlight_step_active())
-		hyperlight_dispatch_push_void_result();
+		hyperlight_dispatch_push_empty_result();
 
 	hyperlight_halt_to_host();
 }
