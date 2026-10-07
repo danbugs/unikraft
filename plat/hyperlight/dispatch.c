@@ -102,10 +102,20 @@ static void hyperlight_dispatch_setenv(char *buf, __sz len)
  */
 static void hyperlight_dispatch_apply_host_env_version(__u64 version)
 {
+	/* The version the kernel's environ was last set from.  It is
+	 * restored with the rest of memory, so after a restore it is the
+	 * snapshot's, and the environment the resume state brought (cached
+	 * under the new host's version) is applied here, without a fetch.
+	 */
+	static __u64 applied;
 	const char *buf;
 	__sz len;
+	int rc = hyperlight_step_env(version, &buf, &len);
 
-	if (hyperlight_step_env(version, &buf, &len) == 1 && len)
+	if (rc < 0 || (rc == 0 && version == applied))
+		return;
+	applied = version;
+	if (len)
 		hyperlight_dispatch_setenv((char *)buf, len);
 }
 #endif /* CONFIG_HYPERLIGHT_STEP */

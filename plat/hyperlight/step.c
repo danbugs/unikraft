@@ -290,33 +290,44 @@ static __u64 fb_deref(const __u8 *b, __u64 len, __u64 pos)
 	return t + 4 <= len ? t : 0;
 }
 
+/* The value table of parameter @idx (counted from the end if negative)
+ * of the size-prefixed FunctionCall @b, when its ParameterValue type is
+ * @type (4: hlulong, 9: hlvecbytes).  0 if there is none.
+ */
+static __u64 fc_param_value(const __u8 *b, __u64 len, __s64 idx, __u8 type)
+{
+	__u64 root, params, count, elem, tf;
+
+	if (!b || len < 8)
+		return 0;
+	root = 4 + fb_u32(b, 4);
+	/* FunctionCall.parameters, then the Parameter. */
+	params = fb_deref(b, len, fb_field_at(b, len, root, 6));
+	if (!params)
+		return 0;
+	count = fb_u32(b, params);
+	if (idx < 0)
+		idx += (__s64)count;
+	if (idx < 0 || (__u64)idx >= count || params + 4 + 4 * count > len)
+		return 0;
+	elem = fb_deref(b, len, params + 4 + 4 * (__u64)idx);
+	if (!elem)
+		return 0;
+	/* Parameter.value_type, then Parameter.value, its table. */
+	tf = fb_field_at(b, len, elem, 4);
+	if (!tf || b[tf] != type)
+		return 0;
+	return fb_deref(b, len, fb_field_at(b, len, elem, 6));
+}
+
 /* The last parameter of the size-prefixed FunctionCall @b when it is a
  * u64 (hlulong): the host's environment version, which it appends to
  * Exec, GuestExec and Call.  0 when there is none.
  */
 static __u64 fc_env_version(const __u8 *b, __u64 len)
 {
-	__u64 root, params, count, elem, value, field, v = 0;
-	__u64 tf;
+	__u64 value = fc_param_value(b, len, -1, 4), field, v = 0;
 
-	if (!b || len < 8)
-		return 0;
-	root = 4 + fb_u32(b, 4);
-	/* FunctionCall.parameters, then its last Parameter. */
-	params = fb_deref(b, len, fb_field_at(b, len, root, 6));
-	if (!params)
-		return 0;
-	count = fb_u32(b, params);
-	if (!count || params + 4 + 4 * count > len)
-		return 0;
-	elem = fb_deref(b, len, params + 4 + 4 * (count - 1));
-	if (!elem)
-		return 0;
-	/* Parameter.value_type 4 is hlulong; Parameter.value its table. */
-	tf = fb_field_at(b, len, elem, 4);
-	if (!tf || b[tf] != 4)
-		return 0;
-	value = fb_deref(b, len, fb_field_at(b, len, elem, 6));
 	if (!value)
 		return 0;
 	/* hlulong.value; absent means its default, 0. */
@@ -324,6 +335,34 @@ static __u64 fc_env_version(const __u8 *b, __u64 len)
 	if (field && field + 8 <= len)
 		memcpy(&v, b + field, sizeof(v));
 	return v;
+}
+
+/* The bytes of parameter @idx of the size-prefixed FunctionCall @b when
+ * it is a byte vector (hlvecbytes), in @out/@out_len.  -1 if it is not.
+ */
+static int fc_param_bytes(const __u8 *b, __u64 len, __u32 idx,
+			  const __u8 **out, __u64 *out_len)
+{
+	__u64 value = fc_param_value(b, len, idx, 9), field, vec, n;
+
+	if (!value)
+		return -1;
+	/* hlvecbytes.value: a [ubyte], absent when empty. */
+	field = fb_field_at(b, len, value, 4);
+	if (!field) {
+		*out = b;
+		*out_len = 0;
+		return 0;
+	}
+	vec = fb_deref(b, len, field);
+	if (!vec)
+		return -1;
+	n = fb_u32(b, vec);
+	if (vec + 4 + n > len)
+		return -1;
+	*out = b + vec + 4;
+	*out_len = n;
+	return 0;
 }
 
 /* The environment version the call in @fc carries (see
@@ -388,8 +427,9 @@ static __u64 hl_env_cache_version;
 
 /* The host's environment for @version, fetched with GetEnvVars only when
  * the version is not the one the copy was fetched under (0: always).
- * Returns 1 if it was fetched, 0 if the copy stood, -1 if it cannot be
- * had; *buf is NUL-terminated, *len without the final NUL.
+ * Returns 1 if it was fetched, 0 if the copy stood (fetched before, or
+ * brought by the resume state), -1 if it cannot be had; *buf is
+ * NUL-terminated, *len without the final NUL.
  */
 int hyperlight_step_env(__u64 version, const char **buf, __sz *len)
 {
@@ -831,38 +871,58 @@ static int hl_state_take(const __u8 **p, const __u8 *end, void *out, __sz n)
 	return 0;
 }
 
-/* What a restored guest needs from its new host, in one host call
- * rather than one each: GetResumeState's reply is the wall clock (u64
- * ns), then the mount table and the resolver configuration, each a u32
- * length and its bytes, as GetMounts and GetResolvConf would answer.
- * -1 if the host has no GetResumeState, or the reply is malformed.
- */
-static int hl_resume_state(void)
+/* Take the environment from the resume state at *@p into the cache. */
+static void hl_resume_env(const __u8 **p, const __u8 *end)
 {
-	__sz cap = hl_hcall_max_payload(), len = 0;
-	const __u8 *p, *end, *mounts, *resolv;
+	__u64 cap = hl_hcall_max_payload(), version;
+	__u32 len;
+
+	if (hl_state_take(p, end, &version, sizeof(version)) < 0 ||
+	    hl_state_take(p, end, &len, sizeof(len)) < 0 ||
+	    (__sz)(end - *p) < len || !version)
+		return;
+	if (!hl_env_cache)
+		hl_env_cache = cap ? uk_malloc(uk_alloc_get_default(), cap) : NULL;
+	if (unlikely(!hl_env_cache) || len >= cap)
+		return;
+	memcpy(hl_env_cache, *p, len);
+	hl_env_cache[len] = '\0';
+	hl_env_cache_len = len;
+	hl_env_cache_version = version;
+	/* A call in flight since the snapshot runs under this host's
+	 * environment now: its driver's GETENV answers from here too.
+	 */
+	hl_call_env_version = version;
+	*p += len;
+}
+
+/* Apply what a restored guest needs from its new host: the wall clock
+ * (u64 ns), then the mount table and the resolver configuration, each a
+ * u32 length and its bytes, as GetMounts and GetResolvConf would answer.
+ * -1 if @state is malformed.
+ */
+static int hl_resume_apply(const __u8 *state, __sz len)
+{
+	const __u8 *p = state, *end = state + len, *mounts, *resolv;
 	__u32 mounts_len, resolv_len;
 	__u64 wall_ns;
-	__u8 *buf;
-	int rc = -1;
 
-	buf = cap ? uk_malloc(uk_alloc_get_default(), cap) : NULL;
-	if (unlikely(!buf))
-		return -1;
-	if (hl_hcall_vecbytes("GetResumeState", NULL, 0, buf, cap, &len) < 0)
-		goto out;
-	p = buf;
-	end = buf + len;
 	if (hl_state_take(&p, end, &wall_ns, sizeof(wall_ns)) < 0 ||
 	    hl_state_take(&p, end, &mounts_len, sizeof(mounts_len)) < 0 ||
 	    (__sz)(end - p) < mounts_len)
-		goto out;
+		return -1;
 	mounts = p;
 	p += mounts_len;
 	if (hl_state_take(&p, end, &resolv_len, sizeof(resolv_len)) < 0 ||
 	    (__sz)(end - p) < resolv_len)
-		goto out;
+		return -1;
 	resolv = p;
+	p += resolv_len;
+	/* Then, from a host that sends it, the environment and its version,
+	 * as a u64, a u32 length and GetEnvVars's answer: the first call
+	 * after the restore then finds it in the cache instead of fetching.
+	 */
+	hl_resume_env(&p, end);
 
 #ifdef CONFIG_LIBHOSTFS
 	hostfs_resume_list((const char *)mounts, mounts_len);
@@ -878,8 +938,29 @@ static int hl_resume_state(void)
 	 * that took it; this host may have another for the guest.
 	 */
 	hyperlight_resolv_apply_text((const char *)resolv, resolv_len);
-	rc = 0;
-out:
+	return 0;
+}
+
+/* The resume state (see hl_resume_apply()): the `resume` entry's
+ * parameter, or, from a host that sends none, GetResumeState's reply,
+ * which costs an exit.  -1 if the host has neither, or it is malformed.
+ */
+static int hl_resume_state(const __u8 *fc, __u64 fc_len)
+{
+	__sz cap = hl_hcall_max_payload(), len = 0;
+	const __u8 *state;
+	__u64 state_len;
+	__u8 *buf;
+	int rc = -1;
+
+	if (fc_param_bytes(fc, fc_len, 0, &state, &state_len) == 0)
+		return hl_resume_apply(state, state_len);
+
+	buf = cap ? uk_malloc(uk_alloc_get_default(), cap) : NULL;
+	if (unlikely(!buf))
+		return -1;
+	if (hl_hcall_vecbytes("GetResumeState", NULL, 0, buf, cap, &len) == 0)
+		rc = hl_resume_apply(buf, len);
 	uk_free(uk_alloc_get_default(), buf);
 	return rc;
 }
@@ -904,10 +985,12 @@ out:
  *   the wall clock is re-anchored on the host's: the guest's kept
  *   counting from the snapshot, not through the time spent on disk;
  *
- *   the resolver configuration is fetched again: the snapshot carries
+ *   the resolver configuration is taken again: the snapshot carries
  *   the file of the machine that took it (see resolv.c).
+ *
+ * The host sends what this takes with the entry (hl_resume_state()).
  */
-static void hl_resume(void)
+static void hl_resume(const __u8 *fc, __u64 fc_len)
 {
 #if CONFIG_LIBUKRANDOM
 	int rc = uk_random_reseed();
@@ -916,10 +999,15 @@ static void hl_resume(void)
 		uk_pr_err("hyperlight: CSPRNG reseed after restore failed: %d\n",
 			  rc);
 #endif /* CONFIG_LIBUKRANDOM */
-	/* One host call for the mounts, the clock and the resolver; a host
-	 * without it answers each on its own.
+	/* From the entry, or from GetResumeState; a host with neither
+	 * answers each on its own.
 	 */
-	if (hl_resume_state() < 0) {
+	/* The environment cache holds the snapshot's, the old host's.  Until
+	 * this host's replaces it, from the entry or a fetch, nothing may
+	 * answer from it.
+	 */
+	hl_env_cache_version = 0;
+	if (hl_resume_state(fc, fc_len) < 0) {
 #ifdef CONFIG_LIBHOSTFS
 		hostfs_resume();
 #endif /* CONFIG_LIBHOSTFS */
@@ -1005,7 +1093,7 @@ int hyperlight_step_pump(const __u8 *fc, __u64 fc_len,
 	}
 
 	if (fc_name_is(fc, fc_len, hl_resume_fn_name))
-		hl_resume();
+		hl_resume(fc, fc_len);
 	else if (!hyperlight_step_fc_is_pump(fc, fc_len))
 		hl_route_call(fc, fc_len);
 
